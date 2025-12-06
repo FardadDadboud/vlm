@@ -1,0 +1,43 @@
+\# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large files/datasets
+*.zip
+*.tar.gz
+checkpoints/
+*.pth
+*.pkl
+*.h5
+*.pt
+*result*
+*output*
+*.png
+*.avi
+*.jpg
+*.jpeg
+*.mp4
+
+# Logs
+*.log
+logs/
+
+

@@ -1,0 +1,52 @@
+{
+  "dataset": {
+    "data_root": "/media/fardad/T7 Touch/DrIFT_flattened",
+    "split": "val",
+    "filters": {
+      "image_filters": {
+        "view": [
+          "Ground"
+        ],
+        "source": [
+          "Synthetic"
+        ],
+        "weather": [
+          "Normal"
+        ],
+        "season": [
+          "Winter"
+        ]
+      },
+      "annotation_filters": {
+        "background": [
+          0,
+          1,
+          2
+        ]
+      }
+    }
+  },
+  "detectors": {
+    "owlv2": {
+      "enabled": true,
+      "model_path": "google/owlv2-large-patch14-ensemble"
+    },
+    "yolo-world": {
+      "enabled": true,
+      "model_path": "yolov8x-worldv2.pt"
+    },
+    "grounding-dino": {
+      "enabled": true,
+      "model_path": "IDEA-Research/grounding-dino-base"
+    }
+  },
+  "evaluation": {
+    "output_dir": "./vlm_evaluation_results",
+    "strategies": [
+      "single_best",
+      "average",
+      "ensemble",
+      "sensitivity"
+    ]
+  }
+}
