@@ -20,6 +20,8 @@ from vlm_drift_dataset import VLMDrIFTDataset
 from vlm_background_evaluator import VLMBackgroundEvaluator  
 from vlm_prompt_evaluator import VLMPromptEvaluator
 
+from vlm_shift_dataset import VLMShiftDataset
+
 
 class VLMEvaluationFramework:
     """
@@ -54,19 +56,28 @@ class VLMEvaluationFramework:
                 return json.load(f)
     
     def _get_default_config(self) -> Dict[str, Any]:
-        """Get default configuration"""
+        """Get default configuration with SHIFT support"""
         return {
             "dataset": {
-                "data_root": "/path/to/DrIFT_dataset",
+                "type": "DrIFT",  # Options: "DrIFT" or "SHIFT"
+                "data_root": "/path/to/dataset",
                 "split": "val",
-                "filters": {
+                # DrIFT-specific filters
+                "drift_filters": {
                     "image_filters": {
                         "view": ["Aerial"],
                         "source": ["Real"]
                     },
                     "annotation_filters": {
-                        "background": [0, 1, 2]  # sky, tree, ground
+                        "background": [0, 1, 2]
                     }
+                },
+                # SHIFT-specific filters
+                "shift_filters": {
+                    "weather": ["clear", "overcast", "rainy"],
+                    "time": ["daytime"],
+                    "max_frames_per_video": None,
+                    "video_sequences": None
                 }
             },
             "detectors": {
@@ -79,11 +90,9 @@ class VLMEvaluationFramework:
                     "model_path": "yolov8s-world.pt"
                 },
                 "grounding-dino": {
-                    "enabled": False,  # Disabled by default due to installation complexity
+                    "enabled": False,
                     "model_path": "IDEA-Research/grounding-dino-base"
                 },
-                
-                
             },
             "evaluation": {
                 "output_dir": "./vlm_evaluation_results",
@@ -131,17 +140,40 @@ class VLMEvaluationFramework:
         print(f"Detector system ready with {len(self.detector_system.detectors)} models")
     
     def _setup_dataset(self):
-        """Setup DrIFT dataset with filtering"""
+        """Setup dataset (SHIFT or DrIFT) based on config"""
         print("Setting up dataset...")
         
         dataset_config = self.config["dataset"]
-        self.dataset = VLMDrIFTDataset(
-            data_root=dataset_config["data_root"],
-            split=dataset_config.get("split", "val"),
-            filters=dataset_config.get("filters")
-        )
+        dataset_type = dataset_config.get("type", "DrIFT")
         
-        print(f"Dataset ready with {len(self.dataset)} samples")
+        if dataset_type == "SHIFT":
+            # Load SHIFT dataset
+            shift_filters = dataset_config.get("shift_filters", {})
+            # Remove None values from filters
+            shift_filters = {k: v for k, v in shift_filters.items() if v is not None}
+            
+            self.dataset = VLMSHIFTDataset(
+                data_root=dataset_config["data_root"],
+                split=dataset_config.get("split", "val"),
+                filters=shift_filters if shift_filters else None
+            )
+            self.dataset_type = "SHIFT"
+            
+        elif dataset_type == "DrIFT":
+            # Load DrIFT dataset (backward compatible)
+            drift_filters = dataset_config.get("drift_filters", 
+                                            dataset_config.get("filters"))
+            
+            self.dataset = VLMDrIFTDataset(
+                data_root=dataset_config["data_root"],
+                split=dataset_config.get("split", "val"),
+                filters=drift_filters
+            )
+            self.dataset_type = "DrIFT"
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_type}. Use 'SHIFT' or 'DrIFT'")
+        
+        print(f"✓ {dataset_type} dataset ready with {len(self.dataset)} samples")
     
     def _setup_evaluators(self):
         """Setup evaluation components"""

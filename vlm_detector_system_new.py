@@ -8,7 +8,7 @@ import matplotlib.patches as patches
 from pathlib import Path
 from tqdm import tqdm
 import json
-from typing import List, Union, Tuple, Dict, Any
+from typing import List, Union, Tuple, Dict, Any, Optional
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 
@@ -64,9 +64,11 @@ class DetectionResult:
     scores: List[float]
     labels: List[str]
     image_path: str
-    model_name: str
+    model_path: str
     depth_map: Any = None  # Optional depth information
     processing_time: float = 0.0
+    features: Any = None  # Optional features (numpy array)
+    class_probs: Any = None  # Optional class probabilities (numpy array)
 
 
 class BaseDetector(ABC):
@@ -117,14 +119,72 @@ class BaseDetector(ABC):
         else:
             final_boxes, final_scores, final_labels = [], [], []
         
-        return DetectionResult(final_boxes, final_scores, final_labels, "", self.model_name)
+        return DetectionResult(final_boxes, final_scores, final_labels, "", "", self.model_path)
+    
+    def _nms_boxes(self, boxes: List[List[float]], scores: List[float], iou_threshold: float = 0.4) -> List[int]:
+        """
+        Apply Non-Maximum Suppression to remove overlapping boxes
+        
+        Args:
+            boxes: List of boxes in [x1, y1, x2, y2] format
+            scores: List of confidence scores
+            iou_threshold: IoU threshold for suppression
+            
+        Returns:
+            List of indices to keep
+        """
+        if len(boxes) == 0:
+            return []
+        
+        # Convert to numpy
+        boxes_np = np.array(boxes, dtype=np.float32)
+        scores_np = np.array(scores, dtype=np.float32)
+        
+        # Get coordinates
+        x1 = boxes_np[:, 0]
+        y1 = boxes_np[:, 1]
+        x2 = boxes_np[:, 2]
+        y2 = boxes_np[:, 3]
+        
+        # Compute areas
+        areas = (x2 - x1) * (y2 - y1)
+        
+        # Sort by score
+        order = scores_np.argsort()[::-1]
+        
+        keep = []
+        while len(order) > 0:
+            # Pick the box with highest score
+            i = order[0]
+            keep.append(int(i))
+            
+            if len(order) == 1:
+                break
+            
+            # Compute IoU with remaining boxes
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            
+            w = np.maximum(0.0, xx2 - xx1)
+            h = np.maximum(0.0, yy2 - yy1)
+            intersection = w * h
+            
+            iou = intersection / (areas[i] + areas[order[1:]] - intersection + 1e-6)
+            
+            # Keep boxes with IoU less than threshold
+            inds = np.where(iou <= iou_threshold)[0]
+            order = order[inds + 1]
+        
+        return keep
 
 
 class OWLv2Detector(BaseDetector):
     """OWLv2 detector implementation"""
 
-    def __init__(self, model_name: str = "google/owlv2-base-patch16-ensemble", device: str = None):
-        self.model_name = model_name
+    def __init__(self, model_path: str = "google/owlv2-base-patch16-ensemble", device: str = None):
+        self.model_path = model_path
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         self.processor = None
         self.model = None
@@ -134,12 +194,12 @@ class OWLv2Detector(BaseDetector):
         if not OWLV2_AVAILABLE:
             raise ImportError("OWLv2 not available. Install with: pip install transformers")
 
-        print(f"Loading OWLv2 model: {self.model_name}")
+        print(f"Loading OWLv2 model: {self.model_path}")
         print(f"Using device: {self.device}")
 
-        self.processor = Owlv2Processor.from_pretrained(self.model_name)
+        self.processor = Owlv2Processor.from_pretrained(self.model_path)
         self.model = Owlv2ForObjectDetection.from_pretrained(
-            self.model_name,
+            self.model_path,
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
             device_map="auto" if self.device == "cuda" else None
         )
@@ -207,7 +267,7 @@ class OWLv2Detector(BaseDetector):
             scores=scores,
             labels=labels,
             image_path="",
-            model_name=self.model_name
+            model_path=self.model_path,
         )
 
 
@@ -261,39 +321,270 @@ class GroundingDINODetector(BaseDetector):
                 labels_list = phrases
 
             else:  # Transformers pipeline
-                results = self.model(image, candidate_labels=texts)
-
+                results = self.model(image, candidate_labels=texts, threshold=threshold)
+                
+                # Apply NMS to remove duplicate detections
+                # Group by box location, keep highest scoring label per box
+                boxes_dict = {}  # key: (x1,y1,x2,y2), value: (score, label)
+                
+                for result in results:
+                    box = result['box']
+                    x1, y1, x2, y2 = box['xmin'], box['ymin'], box['xmax'], box['ymax']
+                    
+                    # Round coordinates to handle floating point
+                    box_key = (round(x1), round(y1), round(x2), round(y2))
+                    score = result['score']
+                    label = result['label']
+                    
+                    # Keep only highest scoring label for this box location
+                    if box_key not in boxes_dict or score > boxes_dict[box_key][0]:
+                        boxes_dict[box_key] = (score, label)
+                
+                # Convert back to lists
                 boxes_list = []
                 scores_list = []
                 labels_list = []
-
-                for result in results:
-                    if result['score'] >= threshold:
-                        box = result['box']
-                        # Convert from xywh to xyxy
-                        x1, y1, w, h = box['xmin'], box['ymin'], box['xmax'] - box['xmin'], box['ymax'] - box['ymin']
-                        boxes_list.append([x1, y1, x1 + w, y1 + h])
-                        scores_list.append(result['score'])
-                        labels_list.append(result['label'])
+                
+                for box_coords, (score, label) in boxes_dict.items():
+                    x1, y1, x2, y2 = box_coords
+                    boxes_list.append([float(x1), float(y1), float(x2), float(y2)])
+                    scores_list.append(float(score))
+                    labels_list.append(label)
+                
+                # Apply standard NMS to remove overlapping boxes
+                if boxes_list:
+                    keep_indices = self._nms_boxes(boxes_list, scores_list, iou_threshold=0.3)
+                    boxes_list = [boxes_list[i] for i in keep_indices]
+                    scores_list = [scores_list[i] for i in keep_indices]
+                    labels_list = [labels_list[i] for i in keep_indices]
 
         except Exception as e:
             print(f"GroundingDINO detection error: {e}")
-            return DetectionResult([], [], [], "", self.model_path)
+            return DetectionResult([], [], [], "", "", self.model_path)
 
         return DetectionResult(
             boxes=boxes_list,
             scores=scores_list,
             labels=labels_list,
             image_path="",
-            model_name=self.model_path
+            model_path=self.model_path
         )
+
+    def detect_with_features(self, image: Image.Image, texts: List[str], threshold: float = 0.05) -> DetectionResult:
+        """
+        Extended detection that returns internal features from the model.
+        Returns DetectionResult with features and class_probs populated.
+        """
+        if not texts or not isinstance(texts, list):
+            return DetectionResult([], [], [], "", self.model_path, None, 0.0, None, None)
+        
+        text_prompt = " . ".join(texts) + " ."
+        
+        try:
+            if hasattr(self.model, 'cuda'):
+                # Custom GroundingDINO - extract features from model internals
+                return self._detect_custom_with_features(image, text_prompt, texts, threshold)
+            else:
+                # Transformers pipeline - extract features from underlying model
+                return self._detect_transformers_with_features(image, text_prompt, texts, threshold)
+        except Exception as e:
+            print(f"Feature extraction error: {e}")
+            return DetectionResult([], [], [], "", self.model_path, None, 0.0, None, None)
+
+    def _detect_custom_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float) -> DetectionResult:
+        """
+        Extract features from custom GroundingDINO model.
+        Access decoder query embeddings directly.
+        """
+        from groundingdino.util.inference import load_image
+        from groundingdino.util import box_ops
+        import groundingdino.datasets.transforms as T
+        
+        # Prepare image
+        image_source, image_tensor = load_image(image)
+        image_tensor = image_tensor.to(self.device)
+        
+        # Prepare text
+        captions = [text_prompt]
+        
+        # Forward pass through model
+        with torch.no_grad():
+            outputs = self.model(image_tensor, captions=captions)
+        
+        # Extract components
+        prediction_logits = outputs["pred_logits"].sigmoid()[0]  # (num_queries, num_classes)
+        prediction_boxes = outputs["pred_boxes"][0]  # (num_queries, 4)
+        
+        # CRITICAL: Extract query features from decoder
+        # These are the f_v_ij embeddings from the paper
+        if "hs" in outputs:
+            # hs contains hidden states from all decoder layers
+            # Shape: (num_decoder_layers, batch_size, num_queries, hidden_dim)
+            query_features = outputs["hs"][-1][0]  # Last layer, first batch: (num_queries, hidden_dim)
+        elif "decoder_output" in outputs:
+            query_features = outputs["decoder_output"][0]
+        else:
+            # Fallback: try to access decoder hidden states
+            query_features = outputs.get("query_embed", None)
+            if query_features is None:
+                raise ValueError("Cannot extract query features from model outputs")
+        
+        query_features = query_features.cpu().numpy()  # (num_queries, hidden_dim)
+        
+        # Tokenize text to get phrase indices
+        tokenized = self.model.tokenizer(text_prompt)
+        
+        # Filter predictions by threshold
+        max_logits = prediction_logits.max(dim=1)[0]
+        mask = max_logits > threshold
+        
+        if mask.sum() == 0:
+            return DetectionResult([], [], [], "", self.model_path, None, 0.0, None, None)
+        
+        # Get filtered predictions
+        logits = prediction_logits[mask]  # (N, num_classes)
+        boxes = prediction_boxes[mask]  # (N, 4)
+        features = query_features[mask.cpu().numpy()]  # (N, hidden_dim)
+        
+        # Convert boxes from [cx, cy, w, h] to [x1, y1, x2, y2]
+        image_h, image_w = image_source.shape[:2]
+        boxes = box_ops.box_cxcywh_to_xyxy(boxes) * torch.tensor([image_w, image_h, image_w, image_h])
+        boxes = boxes.cpu().numpy()
+        
+        # Get class probabilities and labels
+        class_probs = logits.cpu().numpy()  # (N, num_classes)
+        scores = class_probs.max(axis=1)
+        label_indices = class_probs.argmax(axis=1)
+        
+        # Map to text labels
+        labels = []
+        for idx in label_indices:
+            if idx < len(texts):
+                labels.append(texts[idx])
+            else:
+                labels.append("unknown")
+        
+        # Apply NMS to remove duplicates
+        keep_indices = self._nms_boxes(boxes.tolist(), scores.tolist(), iou_threshold=0.5)
+        
+        # Convert to lists to match DetectionResult structure
+        boxes_list = boxes[keep_indices].tolist()
+        scores_list = scores[keep_indices].tolist()
+        labels_list = [labels[i] for i in keep_indices]
+        features_array = features[keep_indices]  # Keep as numpy array
+        class_probs_array = class_probs[keep_indices]  # Keep as numpy array
+        
+        return DetectionResult(
+            boxes=boxes_list,
+            scores=scores_list,
+            labels=labels_list,
+            image_path="",
+            model_path=self.model_path,
+            depth_map=None,
+            processing_time=0.0,
+            features=features_array,  # These are the real f_v_ij embeddings
+            class_probs=class_probs_array
+        )
+
+    def _detect_transformers_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float) -> DetectionResult:
+        """
+        Extract ALL query features and scores.
+        
+        Key: logits[query_i, token_j] = similarity between query i and text token j
+        For each query, extract logits at class token positions, apply sigmoid.
+        """
+        model = self.model.model
+        image_processor = self.model.image_processor
+        tokenizer = self.model.tokenizer
+        
+        # Prepare inputs
+        image_inputs = image_processor(images=image, return_tensors="pt")
+        text_inputs = tokenizer(text_prompt, return_tensors="pt", padding=True, truncation=True)
+        
+        inputs = {
+            **{k: v.to(self.device) for k, v in image_inputs.items()},
+            **{k: v.to(self.device) for k, v in text_inputs.items()}
+        }
+        
+        # Forward pass
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+        
+        # Extract outputs
+        logits = outputs.logits[0]  # (num_queries, 256)
+        pred_boxes = outputs.pred_boxes[0]  # (num_queries, 4)
+        query_features = outputs.decoder_hidden_states[-1][0]  # (num_queries, hidden_dim)
+        
+        # Convert to numpy
+        logits_np = logits.cpu().numpy()
+        pred_boxes_np = pred_boxes.cpu().numpy()
+        query_features_np = query_features.cpu().numpy()
+        
+        # Get tokenized text to find class token positions
+        tokens = tokenizer.convert_ids_to_tokens(text_inputs['input_ids'][0])
+        
+        # Map each class to its token position
+        class_token_positions = []
+        for class_name in texts:
+            # Find position of this class in tokens
+            # Classes appear at positions: 1, 3, 5, 7, 9, 11 for our 6 classes
+            try:
+                pos = tokens.index(class_name)
+                class_token_positions.append(pos)
+            except ValueError:
+                # If exact match not found, try case variations or skip
+                print(f"Warning: Could not find token position for class '{class_name}'")
+                class_token_positions.append(0)  # Fallback
+        
+        # print(f"[DEBUG] Class token positions: {list(zip(texts, class_token_positions))}")
+        
+        # For each query, extract logits at class positions and compute scores
+        num_queries = logits_np.shape[0]
+        num_classes = len(texts)
+        
+        # Extract class-specific logits: (num_queries, num_classes)
+        class_logits = logits_np[:, class_token_positions]  # Select columns for our class positions
+        
+        # Apply sigmoid to get probabilities
+        class_probs = 1 / (1 + np.exp(-class_logits))  # (num_queries, num_classes)
+        
+        # Get max score and label for each query
+        all_scores = class_probs.max(axis=1)  # (num_queries,)
+        all_label_indices = class_probs.argmax(axis=1)  # (num_queries,)
+        all_labels = [texts[idx] for idx in all_label_indices]
+        
+        # Convert boxes to pixel coordinates
+        image_w, image_h = image.size
+        all_boxes_xyxy = np.zeros_like(pred_boxes_np)
+        all_boxes_xyxy[:, 0] = (pred_boxes_np[:, 0] - pred_boxes_np[:, 2] / 2) * image_w
+        all_boxes_xyxy[:, 1] = (pred_boxes_np[:, 1] - pred_boxes_np[:, 3] / 2) * image_h
+        all_boxes_xyxy[:, 2] = (pred_boxes_np[:, 0] + pred_boxes_np[:, 2] / 2) * image_w
+        all_boxes_xyxy[:, 3] = (pred_boxes_np[:, 1] + pred_boxes_np[:, 3] / 2) * image_h
+        
+        # print(f"[DEBUG] Score range: min={all_scores.min():.3f}, max={all_scores.max():.3f}, mean={all_scores.mean():.3f}")
+        # print(f"[DEBUG] Number of queries: {len(all_scores)}")
+        # print(f"[DEBUG] Scores >= {threshold}: {(all_scores >= threshold).sum()}")
+        
+        result = DetectionResult(
+            boxes=all_boxes_xyxy.tolist(),
+            scores=all_scores.tolist(),
+            labels=all_labels,
+            image_path="",
+            model_path=self.model_path,
+            depth_map=None,
+            processing_time=0.0,
+            features=query_features_np,
+            class_probs=class_probs
+        )
+        
+        return result
 
 
 class DETRDetector(BaseDetector):
     """DETR-based object detector"""
 
-    def __init__(self, model_name: str = "facebook/detr-resnet-50", device: str = None):
-        self.model_name = model_name
+    def __init__(self, model_path: str = "facebook/detr-resnet-50", device: str = None):
+        self.model_path = model_path
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         self.processor = None
         self.model = None
@@ -303,11 +594,11 @@ class DETRDetector(BaseDetector):
         if not DETR_AVAILABLE:
             raise ImportError("DETR not available. Install with: pip install transformers")
 
-        print(f"Loading DETR: {self.model_name}")
+        print(f"Loading DETR: {self.model_path}")
         print(f"Using device: {self.device}")
 
-        self.processor = DetrImageProcessor.from_pretrained(self.model_name)
-        self.model = DetrForObjectDetection.from_pretrained(self.model_name)
+        self.processor = DetrImageProcessor.from_pretrained(self.model_path)
+        self.model = DetrForObjectDetection.from_pretrained(self.model_path)
 
         if self.device == "cuda":
             self.model = self.model.to(self.device)
@@ -372,15 +663,15 @@ class DETRDetector(BaseDetector):
             scores=scores,
             labels=labels,
             image_path="",
-            model_name=self.model_name
+            model_path=self.model_path
         )
 
 
 class DepthEstimator:
     """VLM-based monocular depth estimation"""
 
-    def __init__(self, model_name: str = "Intel/dpt-large", device: str = None):
-        self.model_name = model_name
+    def __init__(self, model_path: str = "Intel/dpt-large", device: str = None):
+        self.model_path = model_path
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         self.pipeline = None
         self.load_model()
@@ -389,13 +680,13 @@ class DepthEstimator:
         if not DEPTH_AVAILABLE:
             raise ImportError("Depth estimation not available. Install with: pip install transformers")
 
-        print(f"Loading depth model: {self.model_name}")
+        print(f"Loading depth model: {self.model_path}")
 
         try:
             device_id = 0 if self.device == "cuda" else -1
             self.pipeline = pipeline(
                 "depth-estimation",
-                model=self.model_name,
+                model=self.model_path,
                 device=device_id
             )
             print("✓ Depth estimation model loaded")
@@ -454,8 +745,8 @@ class DepthEstimator:
 class YOLOWorldDetector(BaseDetector):
     """YOLO-World detector implementation"""
 
-    def __init__(self, model_name: str = "yolov8s-world.pt", device: str = None):
-        self.model_name = model_name
+    def __init__(self, model_path: str = "yolov8s-world.pt", device: str = None):
+        self.model_path = model_path
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
         self.classes_set = False
@@ -466,10 +757,10 @@ class YOLOWorldDetector(BaseDetector):
         if not YOLO_WORLD_AVAILABLE:
             raise ImportError("YOLO-World not available. Install with: pip install ultralytics")
 
-        print(f"Loading YOLO-World model: {self.model_name}")
+        print(f"Loading YOLO-World model: {self.model_path}")
         print(f"Using device: {self.device}")
 
-        self.model = YOLO(self.model_name)
+        self.model = YOLO(self.model_path)
 
         # Move model to device but don't use FP16 initially
         if hasattr(self.model.model, 'to'):
@@ -527,7 +818,7 @@ class YOLOWorldDetector(BaseDetector):
             scores=scores,
             labels=labels,
             image_path="",
-            model_name=self.model_name
+            model_path=self.model_path
         )
 
 
@@ -785,7 +1076,7 @@ class MultiModalDetector:
                 fontsize=10
             )
 
-        ax.set_title(f"Detection Results ({result.model_name})")
+        ax.set_title(f"Detection Results ({result.model_path})")
         ax.axis('off')
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -816,7 +1107,7 @@ class MultiModalDetector:
         summary = {
             "total_images": len(results),
             "total_detections": sum(len(r.boxes) for r in results),
-            "model_name": results[0].model_name if results else "unknown",
+            "model_path": results[0].model_path if results else "unknown",
             "results": []
         }
 
