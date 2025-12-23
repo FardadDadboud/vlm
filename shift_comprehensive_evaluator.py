@@ -6,6 +6,7 @@ Runs full baseline VLM evaluation with mAP metrics, visualizations, and logs
 
 import sys
 import json
+import argparse
 from pathlib import Path
 from typing import List, Dict, Any
 from PIL import Image
@@ -15,35 +16,48 @@ import time
 from vlm_shift_dataset import VLMSHIFTDataset
 from vlm_shift_domain_evaluator import VLMSHIFTDomainEvaluator
 from vlm_detector_system_new import OWLv2Detector, GroundingDINODetector, check_gpu_status
-from bca_plus_adapter import BCAPlusAdapter
+from adapters import create_adapter
 
 
-def run_detector_on_dataset(detector, dataset, output_dir: Path, 
-                            target_classes: List[str] = None,
+def load_config(config_path: str) -> Dict[str, Any]:
+    """Load configuration from JSON file"""
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    return config
+
+
+def run_detector_on_dataset(detector, dataset, config: Dict[str, Any], 
+                            output_dir: Path,
                             max_samples: int = None):
     """
     Run detector on dataset and return predictions in COCO format
     """
-    if target_classes is None:
-        target_classes = ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"]
+    target_classes = config['detector']['target_classes']
+    threshold = config['detector']['threshold']
     
     predictions = []
     num_samples = len(dataset) if max_samples is None else min(max_samples, len(dataset))
     
     print(f"\nRunning {detector.model_path} on {num_samples} samples...")
-    print(f"Target classes: {target_classes}\n")
+    print(f"Target classes: {target_classes}")
+    print(f"Threshold: {threshold}\n")
     
     start_time = time.time()
+    
     
     for i in range(num_samples):
         sample = dataset[i]
         image_path = sample['image_path']
+
+        # print(f"***********************DEBUGGING***********************")
+        # print(f"image_path: {image_path}")
+        # print(f"***********************DEBUGGING***********************")
         
         # Load image
         image = Image.open(image_path)
         
-        # FIXED: Use detector directly (it's already wrapped with BCA+)
-        detection_result = detector.adapt_and_detect(image, target_classes, threshold=0.50)
+        # Use adapter (works for both vanilla and BCA+)
+        detection_result = detector.adapt_and_detect(image, target_classes, threshold=threshold)
 
         # Debug: compare with original detection result
         # original_detection_result = detector.detector.detect(image, target_classes, threshold=0.10)
@@ -66,8 +80,9 @@ def run_detector_on_dataset(detector, dataset, output_dir: Path,
             elapsed = time.time() - start_time
             fps = (i + 1) / elapsed
             eta = (num_samples - i - 1) / fps if fps > 0 else 0
+            cache_info = f" | Cache: {detector.cache.M}" if hasattr(detector, 'cache') else ""
             print(f"  Progress: {i+1}/{num_samples} ({100*(i+1)/num_samples:.1f}%) | "
-                  f"FPS: {fps:.2f} | ETA: {eta:.1f}s | Cache size: {detector.cache.M}")
+                  f"FPS: {fps:.2f} | ETA: {eta:.1f}s{cache_info}")
     
     total_time = time.time() - start_time
     print(f"\n✓ Detection complete: {num_samples} images in {total_time:.2f}s ({num_samples/total_time:.2f} FPS)")
@@ -84,23 +99,13 @@ def run_detector_on_dataset(detector, dataset, output_dir: Path,
 def main():
     """Run comprehensive evaluation"""
     
-    # Configuration
-    CONFIG = {
-        'data_root': "/media/fardad/T7 Touch/SHIFT/shift-dev/data",  # UPDATE THIS
-        'split': 'val',
-        'filters': {
-            'weather': ['clear'],  # Test 3 weather conditions
-            'time': ['daytime'],  # Daytime only for initial test
-            'max_frames_per_video': None  # 50 frames per video
-        },
-        "max_samples": None,
-        'detector': {
-            'name': 'grounding-dino',
-            'model_path': 'IDEA-Research/grounding-dino-base'
-        },
-        'output_dir': './shift_comprehensive_eval_results',
-        'num_visualizations': 1000  # Visualizations per domain
-    }
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='SHIFT Comprehensive Evaluation')
+    parser.add_argument('--config', type=str, required=True, help='Path to config JSON file')
+    args = parser.parse_args()
+    
+    # Load configuration
+    CONFIG = load_config(args.config)
     
     print("="*80)
     print("SHIFT Comprehensive Baseline Evaluation")
@@ -109,7 +114,8 @@ def main():
     print(json.dumps(CONFIG, indent=2))
     
     # Create output directory
-    output_dir = Path(CONFIG['output_dir'])
+    # output_dir = Path(CONFIG['output_dir']) + "/" + time.strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(CONFIG['output_dir']) / time.strftime("%Y%m%d_%H%M%S")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Save config
@@ -159,16 +165,16 @@ def main():
         raise ValueError(f"Unknown detector: {CONFIG['detector']['name']}")
 
     # Wrap with BCA+ ONCE
-    detector = BCAPlusAdapter(
+    detector = create_adapter(
+        adaptation_type=CONFIG['adaptation']['type'],
         detector=base_detector,
-        tau1=0.85,
-        tau2=0.85,
-        ws=0.3,
-        num_classes=6
+        config=CONFIG
     )
 
     print(f"\n✓ Detector ready: {detector.model_path}")
-    print(f"✓ BCA+ adapter configured: tau1={detector.tau1}, tau2={detector.tau2}, ws={detector.ws}")
+    if CONFIG['adaptation']['type'] != 'none':
+        print(f"✓ Adaptation: {CONFIG['adaptation']['type']}")
+        print(f"  Parameters: {CONFIG['adaptation']['params']}")
     
     # Step 3: Run detection
     print("\n" + "="*80)
@@ -178,6 +184,7 @@ def main():
     predictions = run_detector_on_dataset(
         detector=detector,
         dataset=dataset,
+        config=CONFIG,
         output_dir=output_dir,
         max_samples=CONFIG['max_samples']
     )

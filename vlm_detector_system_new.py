@@ -320,38 +320,69 @@ class GroundingDINODetector(BaseDetector):
                 scores_list = logits.cpu().numpy().tolist()
                 labels_list = phrases
 
-            else:  # Transformers pipeline
-                results = self.model(image, candidate_labels=texts, threshold=threshold)
+            else:  # Transformers - use manual model forward pass (same as _detect_transformers_with_features)
+                model = self.model.model
+                image_processor = self.model.image_processor
+                tokenizer = self.model.tokenizer
                 
-                # Apply NMS to remove duplicate detections
-                # Group by box location, keep highest scoring label per box
-                boxes_dict = {}  # key: (x1,y1,x2,y2), value: (score, label)
+                # Process image and text SEPARATELY
+                image_inputs = image_processor(images=image, return_tensors="pt")
+                text_inputs = tokenizer(text_prompt, return_tensors="pt", padding=True, truncation=True)
                 
-                for result in results:
-                    box = result['box']
-                    x1, y1, x2, y2 = box['xmin'], box['ymin'], box['xmax'], box['ymax']
-                    
-                    # Round coordinates to handle floating point
-                    box_key = (round(x1), round(y1), round(x2), round(y2))
-                    score = result['score']
-                    label = result['label']
-                    
-                    # Keep only highest scoring label for this box location
-                    if box_key not in boxes_dict or score > boxes_dict[box_key][0]:
-                        boxes_dict[box_key] = (score, label)
+                # Combine inputs
+                inputs = {
+                    **{k: v.to(self.device) for k, v in image_inputs.items()},
+                    **{k: v.to(self.device) for k, v in text_inputs.items()}
+                }
                 
-                # Convert back to lists
-                boxes_list = []
-                scores_list = []
-                labels_list = []
+                # Forward pass
+                with torch.no_grad():
+                    outputs = model(**inputs)
                 
-                for box_coords, (score, label) in boxes_dict.items():
-                    x1, y1, x2, y2 = box_coords
-                    boxes_list.append([float(x1), float(y1), float(x2), float(y2)])
-                    scores_list.append(float(score))
-                    labels_list.append(label)
+                # Extract outputs
+                logits = outputs.logits[0].cpu().numpy()  # (num_queries, 256)
+                pred_boxes = outputs.pred_boxes[0].cpu().numpy()  # (num_queries, 4)
                 
-                # Apply standard NMS to remove overlapping boxes
+                # Get tokenized text to find class token positions
+                tokens = tokenizer.convert_ids_to_tokens(text_inputs['input_ids'][0])
+                
+                # Map each class to its token position
+                class_token_positions = []
+                for class_name in texts:
+                    try:
+                        pos = tokens.index(class_name)
+                        class_token_positions.append(pos)
+                    except ValueError:
+                        print(f"Warning: Could not find token position for class '{class_name}'")
+                        class_token_positions.append(0)
+                
+                # Extract class-specific logits: (num_queries, num_classes)
+                class_logits = logits[:, class_token_positions]
+                
+                # Apply sigmoid to get probabilities
+                class_probs = 1 / (1 + np.exp(-class_logits))  # (num_queries, num_classes)
+                
+                # Get max score and label for each query
+                all_scores = class_probs.max(axis=1)
+                all_label_indices = class_probs.argmax(axis=1)
+                all_labels = [texts[idx] for idx in all_label_indices]
+                
+                # Convert boxes to pixel coordinates
+                image_w, image_h = image.size
+                all_boxes_xyxy = np.zeros_like(pred_boxes)
+                all_boxes_xyxy[:, 0] = (pred_boxes[:, 0] - pred_boxes[:, 2] / 2) * image_w
+                all_boxes_xyxy[:, 1] = (pred_boxes[:, 1] - pred_boxes[:, 3] / 2) * image_h
+                all_boxes_xyxy[:, 2] = (pred_boxes[:, 0] + pred_boxes[:, 2] / 2) * image_w
+                all_boxes_xyxy[:, 3] = (pred_boxes[:, 1] + pred_boxes[:, 3] / 2) * image_h
+                
+                # Filter by threshold
+                mask = all_scores >= threshold
+                
+                boxes_list = all_boxes_xyxy[mask].tolist()
+                scores_list = all_scores[mask].tolist()
+                labels_list = [all_labels[i] for i, m in enumerate(mask) if m]
+                
+                # Apply NMS to remove overlapping boxes
                 if boxes_list:
                     keep_indices = self._nms_boxes(boxes_list, scores_list, iou_threshold=0.3)
                     boxes_list = [boxes_list[i] for i in keep_indices]
@@ -490,17 +521,20 @@ class GroundingDINODetector(BaseDetector):
         """
         Extract ALL query features and scores.
         
-        Key: logits[query_i, token_j] = similarity between query i and text token j
-        For each query, extract logits at class token positions, apply sigmoid.
+        Uses SAME processing as detect() for fair comparison:
+        - Joint text prompt with ". " separator
+        - Separate image_processor and tokenizer
+        - Manual logit extraction at class token positions
         """
         model = self.model.model
         image_processor = self.model.image_processor
         tokenizer = self.model.tokenizer
         
-        # Prepare inputs
+        # Process image and text SEPARATELY (same as detect method)
         image_inputs = image_processor(images=image, return_tensors="pt")
         text_inputs = tokenizer(text_prompt, return_tensors="pt", padding=True, truncation=True)
         
+        # Combine inputs
         inputs = {
             **{k: v.to(self.device) for k, v in image_inputs.items()},
             **{k: v.to(self.device) for k, v in text_inputs.items()}
@@ -526,31 +560,22 @@ class GroundingDINODetector(BaseDetector):
         # Map each class to its token position
         class_token_positions = []
         for class_name in texts:
-            # Find position of this class in tokens
-            # Classes appear at positions: 1, 3, 5, 7, 9, 11 for our 6 classes
             try:
                 pos = tokens.index(class_name)
                 class_token_positions.append(pos)
             except ValueError:
-                # If exact match not found, try case variations or skip
                 print(f"Warning: Could not find token position for class '{class_name}'")
-                class_token_positions.append(0)  # Fallback
-        
-        # print(f"[DEBUG] Class token positions: {list(zip(texts, class_token_positions))}")
-        
-        # For each query, extract logits at class positions and compute scores
-        num_queries = logits_np.shape[0]
-        num_classes = len(texts)
+                class_token_positions.append(0)
         
         # Extract class-specific logits: (num_queries, num_classes)
-        class_logits = logits_np[:, class_token_positions]  # Select columns for our class positions
+        class_logits = logits_np[:, class_token_positions]
         
         # Apply sigmoid to get probabilities
         class_probs = 1 / (1 + np.exp(-class_logits))  # (num_queries, num_classes)
         
         # Get max score and label for each query
-        all_scores = class_probs.max(axis=1)  # (num_queries,)
-        all_label_indices = class_probs.argmax(axis=1)  # (num_queries,)
+        all_scores = class_probs.max(axis=1)
+        all_label_indices = class_probs.argmax(axis=1)
         all_labels = [texts[idx] for idx in all_label_indices]
         
         # Convert boxes to pixel coordinates
@@ -560,10 +585,6 @@ class GroundingDINODetector(BaseDetector):
         all_boxes_xyxy[:, 1] = (pred_boxes_np[:, 1] - pred_boxes_np[:, 3] / 2) * image_h
         all_boxes_xyxy[:, 2] = (pred_boxes_np[:, 0] + pred_boxes_np[:, 2] / 2) * image_w
         all_boxes_xyxy[:, 3] = (pred_boxes_np[:, 1] + pred_boxes_np[:, 3] / 2) * image_h
-        
-        # print(f"[DEBUG] Score range: min={all_scores.min():.3f}, max={all_scores.max():.3f}, mean={all_scores.mean():.3f}")
-        # print(f"[DEBUG] Number of queries: {len(all_scores)}")
-        # print(f"[DEBUG] Scores >= {threshold}: {(all_scores >= threshold).sum()}")
         
         result = DetectionResult(
             boxes=all_boxes_xyxy.tolist(),

@@ -1,0 +1,24 @@
+{
+  "base_config_path": "config/bca_plus.json",
+  "grid_params": {
+    "detector.threshold": [0.05, 0.10, 0.15, 0.20],
+    "detector.iou_threshold": [0.3, 0.5, 0.7],
+    "adaptation.params.tau1": [0.05, 0.1, 0.2, 0.3],
+    "adaptation.params.tau2": [0.7, 0.8, 0.9],
+    "adaptation.params.ws": [0.1, 0.2, 0.3, 0.4, 0.5]
+  },
+  "execution": {
+    "gpu_memory_per_job_gb": 4.0,
+    "safety_margin_gb": 1.0,
+    "checkpoint_frequency": 10
+  },
+  "dataset_subset": {
+    "filters": {
+      "weather": ["clear"],
+      "time": ["daytime"],
+      "max_frames_per_video": null
+    },
+    "max_samples": null
+  },
+  "output_dir": "./shift_bca_plus_grid_search_results"
+}

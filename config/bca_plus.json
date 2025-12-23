@@ -1,0 +1,27 @@
+{
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "filters": {
+    "weather": ["clear"],
+    "time": ["daytime"],
+    "max_frames_per_video": null
+  },
+  "max_samples": null,
+  "detector": {
+    "name": "grounding-dino",
+    "model_path": "IDEA-Research/grounding-dino-base",
+    "threshold": 0.10,
+    "iou_threshold": 0.3,
+    "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"]
+  },
+  "adaptation": {
+    "type": "bca_plus",
+    "params": {
+      "tau1": 0.1,
+      "tau2": 0.8,
+      "ws": 0.4
+    }
+  },
+  "output_dir": "./shift_bca_plus_results",
+  "num_visualizations": 1000
+}
