@@ -28,10 +28,10 @@ except ImportError:
     YOLO_WORLD_AVAILABLE = False
 
 try:
-    import groundingdino.datasets.transforms as T
-    from groundingdino.models import build_model
-    from groundingdino.util import box_ops
-    from groundingdino.util.inference import load_model, load_image, predict, annotate
+    # import groundingdino.datasets.transforms as T
+    # from groundingdino.models import build_model
+    # from groundingdino.util import box_ops
+    # from groundingdino.util.inference import load_model, load_image, predict, annotate
     from transformers import pipeline
 
     GROUNDING_DINO_AVAILABLE = True
@@ -287,13 +287,32 @@ class GroundingDINODetector(BaseDetector):
         print(f"Loading GroundingDINO: {self.model_path}")
         print(f"Using device: {self.device}")
 
+        # Check if model_path is a local directory
+        is_local_path = os.path.isdir(self.model_path) or os.path.isfile(self.model_path)
+        
+        # Check for offline mode via environment variable
+        offline_mode = os.getenv("TRANSFORMERS_OFFLINE", "0") == "1" or is_local_path
+        
+        if is_local_path:
+            print(f"Using local model path: {self.model_path}")
+        elif offline_mode:
+            print("Offline mode enabled - will use cached models only")
+        
         # Use transformers pipeline only
         device_id = 0 if self.device == "cuda" else -1
-        self.model = pipeline(
-            "zero-shot-object-detection",
-            model="IDEA-Research/grounding-dino-base",
-            device=device_id
-        )
+        
+        # Build pipeline arguments
+        pipeline_kwargs = {
+            "task": "zero-shot-object-detection",
+            "model": self.model_path,
+            "device": device_id
+        }
+        
+        # Force offline mode if using local path or environment variable is set
+        if offline_mode:
+            pipeline_kwargs["local_files_only"] = True
+        
+        self.model = pipeline(**pipeline_kwargs)
         print("✓ GroundingDINO (transformers) loaded successfully")
 
     def detect(self, image: Image.Image, texts: List[str], threshold: float = 0.05, iou_threshold: float = 0.3) -> DetectionResult:
@@ -450,100 +469,100 @@ class GroundingDINODetector(BaseDetector):
             print(f"Feature extraction error: {e} {traceback.format_exc()}")
             return DetectionResult([], [], [], "", self.model_path, None, 0.0, None, None)
 
-    def _detect_custom_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float) -> DetectionResult:
-        """
-        Extract features from custom GroundingDINO model.
-        Access decoder query embeddings directly.
-        """
-        from groundingdino.util.inference import load_image
-        from groundingdino.util import box_ops
-        import groundingdino.datasets.transforms as T
+    # def _detect_custom_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float) -> DetectionResult:
+    #     """
+    #     Extract features from custom GroundingDINO model.
+    #     Access decoder query embeddings directly.
+    #     """
+    #     from groundingdino.util.inference import load_image
+    #     from groundingdino.util import box_ops
+    #     import groundingdino.datasets.transforms as T
         
-        # Prepare image
-        image_source, image_tensor = load_image(image)
-        image_tensor = image_tensor.to(self.device)
+    #     # Prepare image
+    #     image_source, image_tensor = load_image(image)
+    #     image_tensor = image_tensor.to(self.device)
         
-        # Prepare text
-        captions = [text_prompt]
+    #     # Prepare text
+    #     captions = [text_prompt]
         
-        # Forward pass through model
-        with torch.no_grad():
-            outputs = self.model(image_tensor, captions=captions)
+    #     # Forward pass through model
+    #     with torch.no_grad():
+    #         outputs = self.model(image_tensor, captions=captions)
         
-        # Extract components
-        prediction_logits = outputs["pred_logits"].sigmoid()[0]  # (num_queries, num_classes)
-        prediction_boxes = outputs["pred_boxes"][0]  # (num_queries, 4)
+    #     # Extract components
+    #     prediction_logits = outputs["pred_logits"].sigmoid()[0]  # (num_queries, num_classes)
+    #     prediction_boxes = outputs["pred_boxes"][0]  # (num_queries, 4)
         
-        # CRITICAL: Extract query features from decoder
-        # These are the f_v_ij embeddings from the paper
-        if "hs" in outputs:
-            # hs contains hidden states from all decoder layers
-            # Shape: (num_decoder_layers, batch_size, num_queries, hidden_dim)
-            query_features = outputs["hs"][-1][0]  # Last layer, first batch: (num_queries, hidden_dim)
-        elif "decoder_output" in outputs:
-            query_features = outputs["decoder_output"][0]
-        else:
-            # Fallback: try to access decoder hidden states
-            query_features = outputs.get("query_embed", None)
-            if query_features is None:
-                raise ValueError("Cannot extract query features from model outputs")
+    #     # CRITICAL: Extract query features from decoder
+    #     # These are the f_v_ij embeddings from the paper
+    #     if "hs" in outputs:
+    #         # hs contains hidden states from all decoder layers
+    #         # Shape: (num_decoder_layers, batch_size, num_queries, hidden_dim)
+    #         query_features = outputs["hs"][-1][0]  # Last layer, first batch: (num_queries, hidden_dim)
+    #     elif "decoder_output" in outputs:
+    #         query_features = outputs["decoder_output"][0]
+    #     else:
+    #         # Fallback: try to access decoder hidden states
+    #         query_features = outputs.get("query_embed", None)
+    #         if query_features is None:
+    #             raise ValueError("Cannot extract query features from model outputs")
         
-        query_features = query_features.cpu().numpy()  # (num_queries, hidden_dim)
+    #     query_features = query_features.cpu().numpy()  # (num_queries, hidden_dim)
         
-        # Tokenize text to get phrase indices
-        tokenized = self.model.tokenizer(text_prompt)
+    #     # Tokenize text to get phrase indices
+    #     tokenized = self.model.tokenizer(text_prompt)
         
-        # Filter predictions by threshold
-        max_logits = prediction_logits.max(dim=1)[0]
-        mask = max_logits > threshold
+    #     # Filter predictions by threshold
+    #     max_logits = prediction_logits.max(dim=1)[0]
+    #     mask = max_logits > threshold
         
-        if mask.sum() == 0:
-            return DetectionResult([], [], [], "", self.model_path, None, 0.0, None, None)
+    #     if mask.sum() == 0:
+    #         return DetectionResult([], [], [], "", self.model_path, None, 0.0, None, None)
         
-        # Get filtered predictions
-        logits = prediction_logits[mask]  # (N, num_classes)
-        boxes = prediction_boxes[mask]  # (N, 4)
-        features = query_features[mask.cpu().numpy()]  # (N, hidden_dim)
+    #     # Get filtered predictions
+    #     logits = prediction_logits[mask]  # (N, num_classes)
+    #     boxes = prediction_boxes[mask]  # (N, 4)
+    #     features = query_features[mask.cpu().numpy()]  # (N, hidden_dim)
         
-        # Convert boxes from [cx, cy, w, h] to [x1, y1, x2, y2]
-        image_h, image_w = image_source.shape[:2]
-        boxes = box_ops.box_cxcywh_to_xyxy(boxes) * torch.tensor([image_w, image_h, image_w, image_h])
-        boxes = boxes.cpu().numpy()
+    #     # Convert boxes from [cx, cy, w, h] to [x1, y1, x2, y2]
+    #     image_h, image_w = image_source.shape[:2]
+    #     boxes = box_ops.box_cxcywh_to_xyxy(boxes) * torch.tensor([image_w, image_h, image_w, image_h])
+    #     boxes = boxes.cpu().numpy()
         
-        # Get class probabilities and labels
-        class_probs = logits.cpu().numpy()  # (N, num_classes)
-        scores = class_probs.max(axis=1)
-        label_indices = class_probs.argmax(axis=1)
+    #     # Get class probabilities and labels
+    #     class_probs = logits.cpu().numpy()  # (N, num_classes)
+    #     scores = class_probs.max(axis=1)
+    #     label_indices = class_probs.argmax(axis=1)
         
-        # Map to text labels
-        labels = []
-        for idx in label_indices:
-            if idx < len(texts):
-                labels.append(texts[idx])
-            else:
-                labels.append("unknown")
+    #     # Map to text labels
+    #     labels = []
+    #     for idx in label_indices:
+    #         if idx < len(texts):
+    #             labels.append(texts[idx])
+    #         else:
+    #             labels.append("unknown")
         
-        # Apply NMS to remove duplicates
-        keep_indices = self._nms_boxes(boxes.tolist(), scores.tolist(), iou_threshold=0.5)
+    #     # Apply NMS to remove duplicates
+    #     keep_indices = self._nms_boxes(boxes.tolist(), scores.tolist(), iou_threshold=0.5)
         
-        # Convert to lists to match DetectionResult structure
-        boxes_list = boxes[keep_indices].tolist()
-        scores_list = scores[keep_indices].tolist()
-        labels_list = [labels[i] for i in keep_indices]
-        features_array = features[keep_indices]  # Keep as numpy array
-        class_probs_array = class_probs[keep_indices]  # Keep as numpy array
+    #     # Convert to lists to match DetectionResult structure
+    #     boxes_list = boxes[keep_indices].tolist()
+    #     scores_list = scores[keep_indices].tolist()
+    #     labels_list = [labels[i] for i in keep_indices]
+    #     features_array = features[keep_indices]  # Keep as numpy array
+    #     class_probs_array = class_probs[keep_indices]  # Keep as numpy array
         
-        return DetectionResult(
-            boxes=boxes_list,
-            scores=scores_list,
-            labels=labels_list,
-            image_path="",
-            model_path=self.model_path,
-            depth_map=None,
-            processing_time=0.0,
-            features=features_array,  # These are the real f_v_ij embeddings
-            class_probs=class_probs_array
-        )
+    #     return DetectionResult(
+    #         boxes=boxes_list,
+    #         scores=scores_list,
+    #         labels=labels_list,
+    #         image_path="",
+    #         model_path=self.model_path,
+    #         depth_map=None,
+    #         processing_time=0.0,
+    #         features=features_array,  # These are the real f_v_ij embeddings
+    #         class_probs=class_probs_array
+    #     )
 
     def _detect_transformers_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float, alpha: float = 0.7) -> DetectionResult:
         """

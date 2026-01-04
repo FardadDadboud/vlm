@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import argparse
+import concurrent.futures
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import Dict, Any
@@ -162,6 +163,22 @@ def run_grid_search(grid_config_path: str):
     all_results = []
     checkpoint_file = output_dir / 'checkpoint.json'
     
+    # Resume from checkpoint if exists
+    completed_exp_ids = set()
+    if checkpoint_file.exists():
+        print(f"\n{'='*80}")
+        print("CHECKPOINT FOUND - Resuming from previous run")
+        print(f"{'='*80}\n")
+        with open(checkpoint_file, 'r') as f:
+            all_results = json.load(f)
+        completed_exp_ids = {r['exp_id'] for r in all_results}
+        print(f"Loaded {len(all_results)} completed experiments")
+        print(f"Remaining: {len(queue.experiments) - len(all_results)}\n")
+        
+        # Remove completed experiments from queue
+        queue.pending = [eid for eid in queue.pending if eid not in completed_exp_ids]
+        queue.completed = list(completed_exp_ids)
+    
     # Main execution loop
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
@@ -186,10 +203,43 @@ def run_grid_search(grid_config_path: str):
                 
                 for future in done:
                     exp_id, gpu_id = futures.pop(future)
-                    result = future.result()
+                    
+                    # Robust error handling for OOM and broken processes
+                    try:
+                        result = future.result()
+                    except concurrent.futures.process.BrokenProcessPool as e:
+                        print(f"\n{'='*80}")
+                        print(f"WARNING: Process pool broken (likely OOM kill)")
+                        print(f"Experiment {exp_id} failed - marking as OOM error")
+                        print(f"Saving checkpoint and continuing...")
+                        print(f"{'='*80}\n")
+                        result = {
+                            'exp_id': exp_id,
+                            'params': queue.experiments[exp_id]['params'],
+                            'error': 'OOM_KILL - Process terminated by system',
+                            'gpu_id': gpu_id,
+                            'status': 'oom_killed'
+                        }
+                    except Exception as e:
+                        print(f"\n{'='*80}")
+                        print(f"WARNING: Unexpected error in experiment {exp_id}")
+                        print(f"Error: {str(e)}")
+                        print(f"{'='*80}\n")
+                        result = {
+                            'exp_id': exp_id,
+                            'params': queue.experiments[exp_id]['params'],
+                            'error': str(e),
+                            'gpu_id': gpu_id,
+                            'status': 'failed'
+                        }
+                    
                     all_results.append(result)
                     queue.mark_completed(exp_id)
                     gpu_manager.release_gpu(gpu_id, memory_per_job)
+                    
+                    # Save checkpoint immediately after each result
+                    with open(checkpoint_file, 'w') as f:
+                        json.dump(all_results, f, indent=2)
                     
                     # Print progress
                     progress = queue.get_progress()
@@ -204,12 +254,9 @@ def run_grid_search(grid_config_path: str):
                     if result['status'] == 'success':
                         print(f"  mAP@50: {result['metrics']['mAP_50']:.4f}")
                     else:
-                        print(f"  ERROR: {result['error']}")
-                    
-                    # Checkpoint
-                    if len(all_results) % grid_config['execution']['checkpoint_frequency'] == 0:
-                        with open(checkpoint_file, 'w') as f:
-                            json.dump(all_results, f, indent=2)
+                        print(f"  Status: {result['status']}")
+                        if 'error' in result:
+                            print(f"  Error: {result['error'][:100]}...")  # Truncate long errors
     
     # Save final results
     results_file = output_dir / 'results.json'
@@ -223,13 +270,47 @@ def run_grid_search(grid_config_path: str):
     print(f"Total time: {(time.time() - start_time)/60:.1f} minutes")
     print(f"Results saved to: {results_file}")
     
-    # Find best configuration
+    # Analyze results
     successful_results = [r for r in all_results if r['status'] == 'success']
+    failed_results = [r for r in all_results if r['status'] == 'failed']
+    oom_results = [r for r in all_results if r['status'] == 'oom_killed']
+    
+    print(f"\nExperiment Summary:")
+    print(f"  Total: {len(all_results)}")
+    print(f"  Successful: {len(successful_results)}")
+    print(f"  Failed: {len(failed_results)}")
+    print(f"  OOM Killed: {len(oom_results)}")
+    
+    if oom_results:
+        print(f"\n{'='*80}")
+        print("OOM Killed Experiments (consider reducing memory usage):")
+        print(f"{'='*80}")
+        for r in oom_results[:5]:  # Show first 5
+            print(f"  Exp {r['exp_id']}: {r['params']}")
+        if len(oom_results) > 5:
+            print(f"  ... and {len(oom_results)-5} more")
+    
+    if failed_results:
+        print(f"\n{'='*80}")
+        print("Failed Experiments:")
+        print(f"{'='*80}")
+        for r in failed_results[:5]:  # Show first 5
+            error_msg = r.get('error', 'Unknown error')
+            print(f"  Exp {r['exp_id']}: {error_msg[:80]}...")
+        if len(failed_results) > 5:
+            print(f"  ... and {len(failed_results)-5} more")
+    
+    # Find best configuration
     if successful_results:
         best = max(successful_results, key=lambda x: x['metrics']['mAP_50'])
         print(f"\nBest Configuration:")
         print(f"  Parameters: {best['params']}")
         print(f"  mAP@50: {best['metrics']['mAP_50']:.4f}")
+    else:
+        print(f"\n{'='*80}")
+        print("WARNING: No successful experiments!")
+        print("All experiments failed - check errors above")
+        print(f"{'='*80}")
 
 
 if __name__ == "__main__":
