@@ -249,6 +249,9 @@ class VLMSHIFTDomainEvaluator:
             # Convert bbox from [x1,y1,x2,y2] to [x,y,w,h] for COCO
             x1, y1, x2, y2 = anno_copy['bbox']
             anno_copy['bbox'] = [x1, y1, x2-x1, y2-y1]
+            # In _evaluate_single_domain, after anno_copy['bbox'] conversion (around line 251):
+            if 'iscrowd' not in anno_copy:
+                anno_copy['iscrowd'] = 0  # IMPORTANT: COCO requires this field
             coco_gt['annotations'].append(anno_copy)
         
         # Save GT to temp file
@@ -278,6 +281,11 @@ class VLMSHIFTDomainEvaluator:
             coco_eval.evaluate()
             coco_eval.accumulate()
             coco_eval.summarize()
+
+            # After line 280 (coco_eval.summarize()), add:
+            self._debug_evaluation_details(coco, coco_dt, coco_eval, domain_name)
+            best_threshold = self._analyze_score_distribution_by_match(coco, coco_dt, coco_eval, domain_name)
+            self._analyze_nms_threshold(predictions, coco, domain_name, confidence_threshold=best_threshold)  # Use best conf threshold from previous analysis
             
             # Extract metrics
             metrics = {
@@ -300,6 +308,418 @@ class VLMSHIFTDomainEvaluator:
         finally:
             # Clean up temp file
             os.unlink(gt_file)
+
+    def _analyze_score_distribution_by_match(self, coco, coco_dt, coco_eval, domain_name):
+        """Analyze score distribution for TPs vs FPs to find optimal threshold"""
+        import numpy as np
+        
+        n_imgs = len(coco_eval.params.imgIds)
+        n_cats = len(coco_eval.params.catIds)
+        n_areas = len(coco_eval.params.areaRng)
+        
+        tp_scores = []
+        fp_scores = []
+        
+        area_idx = 0  # 'all'
+        iou_idx = 0   # IoU=0.5
+        
+        for cat_idx in range(n_cats):
+            for img_idx in range(n_imgs):
+                eval_idx = cat_idx * (n_areas * n_imgs) + area_idx * n_imgs + img_idx
+                evalImg = coco_eval.evalImgs[eval_idx]
+                
+                if evalImg is None:
+                    continue
+                
+                dtMatches = evalImg.get('dtMatches', None)
+                dtScores = evalImg.get('dtScores', None)
+                
+                if dtMatches is not None and dtScores is not None and len(dtScores) > 0:
+                    matches_at_iou50 = dtMatches[iou_idx]
+                    for i, (match, score) in enumerate(zip(matches_at_iou50, dtScores)):
+                        if match > 0:
+                            tp_scores.append(score)
+                        else:
+                            fp_scores.append(score)
+        
+        tp_scores = np.array(tp_scores)
+        fp_scores = np.array(fp_scores)
+        
+        print(f"\n  === SCORE DISTRIBUTION ANALYSIS ===")
+        print(f"  True Positive scores:")
+        print(f"    Count: {len(tp_scores)}")
+        print(f"    Mean: {tp_scores.mean():.4f}, Median: {np.median(tp_scores):.4f}")
+        print(f"    Min: {tp_scores.min():.4f}, Max: {tp_scores.max():.4f}")
+        print(f"    Percentiles [25, 50, 75, 90]: {np.percentile(tp_scores, [25, 50, 75, 90])}")
+        
+        print(f"\n  False Positive scores:")
+        print(f"    Count: {len(fp_scores)}")
+        print(f"    Mean: {fp_scores.mean():.4f}, Median: {np.median(fp_scores):.4f}")
+        print(f"    Min: {fp_scores.min():.4f}, Max: {fp_scores.max():.4f}")
+        print(f"    Percentiles [25, 50, 75, 90]: {np.percentile(fp_scores, [25, 50, 75, 90])}")
+        
+        # Find optimal threshold using F1
+        print(f"\n  === THRESHOLD ANALYSIS ===")
+        print(f"  {'Threshold':>10s} {'Precision':>10s} {'Recall':>10s} {'F1':>10s} {'TP':>8s} {'FP':>8s}")
+        print(f"  {'-'*58}")
+        
+        best_f1 = 0
+        best_threshold = 0
+        
+        for thresh in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7]:
+            tp = (tp_scores >= thresh).sum()
+            fp = (fp_scores >= thresh).sum()
+            fn = (tp_scores < thresh).sum()
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            
+            print(f"  {thresh:>10.2f} {precision:>10.4f} {recall:>10.4f} {f1:>10.4f} {tp:>8d} {fp:>8d}")
+            
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = thresh
+        
+        print(f"\n  Best F1={best_f1:.4f} at threshold={best_threshold}")
+        print(f"  === END SCORE ANALYSIS ===\n")
+
+        return best_threshold
+
+    def _analyze_nms_threshold(self, predictions: List[Dict], coco, domain_name: str, 
+                            confidence_threshold: float = 0.15):
+        """
+        Analyze different NMS IoU thresholds to find optimal for deployment.
+        """
+        import numpy as np
+        from collections import defaultdict
+        
+        try:
+            from torchvision.ops import nms
+            import torch
+            USE_TORCH_NMS = True
+        except ImportError:
+            USE_TORCH_NMS = False
+            print("  Warning: torchvision not available, using custom NMS")
+        
+        print(f"\n  === NMS THRESHOLD ANALYSIS (conf_thresh={confidence_threshold}) ===")
+        
+        # DEBUG: Quick sanity check
+        print(f"  COCO GT: {len(coco.getAnnIds())} annotations, {len(coco.getImgIds())} images")
+        print(f"  Predictions: {len(predictions)} total")
+        
+        # Step 1: Group predictions by image_id
+        # predictions bbox is in [x1, y1, x2, y2] format (NOT yet converted to COCO)
+        preds_by_image = defaultdict(list)
+        for pred in predictions:
+            # predictions are in [x1, y1, x2, y2] format here!
+            preds_by_image[pred['image_id']].append({
+                'bbox': pred['bbox'],  # Keep as [x1, y1, x2, y2]
+                'score': pred['score'],
+                'category_id': pred['category_id']
+            })
+        
+        # NMS IoU thresholds to test
+        nms_thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        
+        results = []
+        
+        for nms_thresh in nms_thresholds:
+            total_tp = 0
+            total_fp = 0
+            total_fn = 0
+            total_preds_after_nms = 0
+            
+            for image_id in coco.getImgIds():
+                image_preds = preds_by_image.get(image_id, [])
+                
+                # Get GT annotations - NOTE: imgIds must be a LIST!
+                gt_ann_ids = coco.getAnnIds(imgIds=[image_id])
+                gt_anns = coco.loadAnns(gt_ann_ids)
+                
+                if len(image_preds) == 0:
+                    # Count all GT as FN
+                    total_fn += len(gt_anns)
+                    continue
+                
+                # Extract arrays - bbox is in [x1, y1, x2, y2] format
+                boxes = np.array([p['bbox'] for p in image_preds])
+                scores = np.array([p['score'] for p in image_preds])
+                cat_ids = np.array([p['category_id'] for p in image_preds])
+                
+                # Step 1: Apply confidence threshold
+                conf_mask = scores >= confidence_threshold
+                boxes = boxes[conf_mask]
+                scores = scores[conf_mask]
+                cat_ids = cat_ids[conf_mask]
+                
+                if len(boxes) == 0:
+                    total_fn += len(gt_anns)
+                    continue
+                
+                # Step 2: Apply NMS per class
+                final_boxes = []
+                final_scores = []
+                final_cat_ids = []
+                
+                unique_cats = np.unique(cat_ids)
+                for cat_id in unique_cats:
+                    cat_mask = cat_ids == cat_id
+                    cat_boxes = boxes[cat_mask]
+                    cat_scores = scores[cat_mask]
+                    
+                    if nms_thresh < 1.0 and len(cat_boxes) > 0:
+                        if USE_TORCH_NMS:
+                            boxes_tensor = torch.tensor(cat_boxes, dtype=torch.float32)
+                            scores_tensor = torch.tensor(cat_scores, dtype=torch.float32)
+                            keep_indices = nms(boxes_tensor, scores_tensor, nms_thresh)
+                            keep_indices = keep_indices.numpy()
+                        else:
+                            keep_indices = self._custom_nms(cat_boxes, cat_scores, nms_thresh)
+                        
+                        final_boxes.extend(cat_boxes[keep_indices])
+                        final_scores.extend(cat_scores[keep_indices])
+                        final_cat_ids.extend([cat_id] * len(keep_indices))
+                    else:
+                        final_boxes.extend(cat_boxes)
+                        final_scores.extend(cat_scores)
+                        final_cat_ids.extend([cat_id] * len(cat_boxes))
+                
+                final_boxes = np.array(final_boxes) if final_boxes else np.array([]).reshape(0, 4)
+                final_scores = np.array(final_scores) if final_scores else np.array([])
+                final_cat_ids = np.array(final_cat_ids) if final_cat_ids else np.array([])
+                
+                total_preds_after_nms += len(final_boxes)
+                
+                # Step 3: Prepare GT boxes
+                gt_boxes = []
+                gt_cats = []
+                gt_matched = []
+                
+                for ann in gt_anns:
+                    # COCO GT bbox is [x, y, w, h], convert to [x1, y1, x2, y2]
+                    x, y, w, h = ann['bbox']
+                    gt_boxes.append([x, y, x + w, y + h])
+                    gt_cats.append(ann['category_id'])
+                    gt_matched.append(False)
+                
+                gt_boxes = np.array(gt_boxes) if gt_boxes else np.array([]).reshape(0, 4)
+                
+                # Sort predictions by score (descending)
+                if len(final_scores) > 0:
+                    sort_idx = np.argsort(-final_scores)
+                    final_boxes = final_boxes[sort_idx]
+                    final_scores = final_scores[sort_idx]
+                    final_cat_ids = final_cat_ids[sort_idx]
+                
+                # Greedy matching
+                for pred_box, pred_cat_id in zip(final_boxes, final_cat_ids):
+                    best_iou = 0
+                    best_gt_idx = -1
+                    
+                    for gt_idx, (gt_box, gt_cat) in enumerate(zip(gt_boxes, gt_cats)):
+                        if gt_matched[gt_idx]:
+                            continue
+                        if gt_cat != pred_cat_id:
+                            continue
+                        
+                        iou = self._compute_iou(pred_box, gt_box)
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_gt_idx = gt_idx
+                    
+                    if best_iou >= 0.5 and best_gt_idx >= 0:
+                        total_tp += 1
+                        gt_matched[best_gt_idx] = True
+                    else:
+                        total_fp += 1
+                
+                # Count unmatched GT as FN
+                total_fn += sum(1 for m in gt_matched if not m)
+            
+            # Compute metrics
+            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            
+            results.append({
+                'nms_thresh': nms_thresh,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'tp': total_tp,
+                'fp': total_fp,
+                'fn': total_fn,
+                'total_preds': total_preds_after_nms
+            })
+        
+        # Print results
+        print(f"  {'NMS_IoU':>10s} {'Precision':>10s} {'Recall':>10s} {'F1':>10s} {'TP':>8s} {'FP':>8s} {'#Preds':>10s}")
+        print(f"  {'-'*68}")
+        
+        best_f1 = 0
+        best_nms_thresh = 1.0
+        
+        for r in results:
+            print(f"  {r['nms_thresh']:>10.2f} {r['precision']:>10.4f} {r['recall']:>10.4f} "
+                f"{r['f1']:>10.4f} {r['tp']:>8d} {r['fp']:>8d} {r['total_preds']:>10d}")
+            
+            if r['f1'] > best_f1:
+                best_f1 = r['f1']
+                best_nms_thresh = r['nms_thresh']
+        
+        print(f"\n  Best F1={best_f1:.4f} at NMS_IoU={best_nms_thresh}")
+        print(f"  === END NMS ANALYSIS ===\n")
+        
+        return results, best_nms_thresh
+
+    def _compute_iou(self, box1, box2):
+        """Compute IoU between two boxes [x1, y1, x2, y2]"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+        
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        
+        union_area = box1_area + box2_area - inter_area
+        
+        if union_area <= 0:
+            return 0.0
+        
+        return inter_area / union_area
+
+    def _custom_nms(self, boxes, scores, iou_threshold):
+        """Custom NMS implementation if torchvision not available"""
+        if len(boxes) == 0:
+            return np.array([], dtype=int)
+        
+        # Sort by score descending
+        order = np.argsort(-scores)
+        keep = []
+        
+        while len(order) > 0:
+            idx = order[0]
+            keep.append(idx)
+            
+            if len(order) == 1:
+                break
+            
+            # Compute IoU with remaining boxes
+            remaining = order[1:]
+            ious = np.array([self._compute_iou(boxes[idx], boxes[r]) for r in remaining])
+            
+            # Keep boxes with IoU below threshold
+            mask = ious < iou_threshold
+            order = remaining[mask]
+        
+        return np.array(keep, dtype=int)
+
+    def _debug_evaluation_details(self, coco, coco_dt, coco_eval, domain_name):
+        """Debug: Analyze TP/FP distribution - CORRECTED VERSION"""
+        import numpy as np
+        
+        print(f"\n  === DEBUG for {domain_name} ===")
+        
+        # 1. Score distribution analysis
+        all_scores = []
+        for img_id in coco.getImgIds():
+            dt_anns = coco_dt.loadAnns(coco_dt.getAnnIds(imgIds=img_id))
+            all_scores.extend([ann['score'] for ann in dt_anns])
+        
+        if all_scores:
+            scores_arr = np.array(all_scores)
+            print(f"  Score distribution:")
+            print(f"    Min: {scores_arr.min():.4f}, Max: {scores_arr.max():.4f}")
+            print(f"    Mean: {scores_arr.mean():.4f}, Median: {np.median(scores_arr):.4f}")
+            print(f"    Scores > 0.5: {(scores_arr > 0.5).sum()} ({100*(scores_arr > 0.5).mean():.1f}%)")
+            print(f"    Scores > 0.3: {(scores_arr > 0.3).sum()} ({100*(scores_arr > 0.3).mean():.1f}%)")
+            print(f"    Scores > 0.1: {(scores_arr > 0.1).sum()} ({100*(scores_arr > 0.1).mean():.1f}%)")
+        
+        # 2. Per-category breakdown
+        print(f"\n  Per-category breakdown:")
+        for cat_id, cat_name in [(1, 'pedestrian'), (2, 'car'), (3, 'truck'), 
+                                (4, 'bus'), (5, 'motorcycle'), (6, 'bicycle')]:
+            gt_count = len(coco.getAnnIds(catIds=[cat_id]))
+            dt_count = len(coco_dt.getAnnIds(catIds=[cat_id]))
+            if gt_count > 0 or dt_count > 0:
+                ratio = dt_count / gt_count if gt_count > 0 else float('inf')
+                print(f"    {cat_name:12s}: GT={gt_count:5d}, Pred={dt_count:6d}, Ratio={ratio:.2f}x")
+        
+        # 3. CORRECTED: Analyze TP/FP/FN - filter to areaRng='all' only
+        # coco_eval.params.areaRng = [[0, 10000000000.0], [0, 1024], [1024, 9216], [9216, 10000000000.0]]
+        # areaRngLbl = ['all', 'small', 'medium', 'large']
+        # We only want index 0 (area='all')
+        
+        tp_count = 0
+        fp_count = 0
+        fn_count = 0
+        
+        # evalImgs is organized as: [img0_cat0_area0, img0_cat0_area1, ..., img0_cat1_area0, ...]
+        # Shape is effectively: n_cats × n_areas × n_imgs (flattened)
+        n_imgs = len(coco_eval.params.imgIds)
+        n_cats = len(coco_eval.params.catIds)
+        n_areas = len(coco_eval.params.areaRng)  # 4: all, small, medium, large
+        
+        print(f"\n  Eval structure: {n_imgs} imgs × {n_cats} cats × {n_areas} areas = {len(coco_eval.evalImgs)} evalImgs")
+        
+        # Only process area='all' (index 0)
+        area_idx = 0  # 'all'
+        iou_idx = 0   # IoU=0.5 (first threshold)
+        
+        for cat_idx in range(n_cats):
+            for img_idx in range(n_imgs):
+                # Index calculation: cat_idx * (n_areas * n_imgs) + area_idx * n_imgs + img_idx
+                eval_idx = cat_idx * (n_areas * n_imgs) + area_idx * n_imgs + img_idx
+                
+                evalImg = coco_eval.evalImgs[eval_idx]
+                if evalImg is None:
+                    continue
+                
+                dtMatches = evalImg.get('dtMatches', None)
+                if dtMatches is not None and len(dtMatches) > 0:
+                    matches_at_iou50 = dtMatches[iou_idx]
+                    tp_count += (matches_at_iou50 > 0).sum()
+                    fp_count += (matches_at_iou50 == 0).sum()
+                
+                gtMatches = evalImg.get('gtMatches', None)
+                if gtMatches is not None and len(gtMatches) > 0:
+                    fn_count += (gtMatches[iou_idx] == 0).sum()
+        
+        total_gt = len(coco.getAnnIds())
+        total_pred = len(coco_dt.getAnnIds())
+        
+        print(f"\n  Sanity check:")
+        print(f"    Total GT annotations: {total_gt}")
+        print(f"    Total predictions: {total_pred}")
+        print(f"    TP + FN = {tp_count + fn_count} (should ≈ {total_gt})")
+        print(f"    TP + FP = {tp_count + fp_count} (should ≈ {total_pred})")
+        
+        print(f"\n  TP/FP/FN at IoU=0.5 (area='all'):")
+        print(f"    True Positives:  {tp_count}")
+        print(f"    False Positives: {fp_count}")
+        print(f"    False Negatives: {fn_count}")
+        if tp_count + fp_count > 0:
+            print(f"    Precision: {tp_count / (tp_count + fp_count):.4f}")
+        if tp_count + fn_count > 0:
+            print(f"    Recall: {tp_count / (tp_count + fn_count):.4f}")
+        
+        # 4. Additional: Check maxDets truncation impact
+        print(f"\n  maxDets analysis:")
+        imgs_over_100_preds = 0
+        total_truncated = 0
+        for img_id in coco.getImgIds():
+            n_preds = len(coco_dt.getAnnIds(imgIds=img_id))
+            if n_preds > 100:
+                imgs_over_100_preds += 1
+                total_truncated += (n_preds - 100)
+        print(f"    Images with >100 predictions: {imgs_over_100_preds}")
+        print(f"    Total predictions truncated by maxDets=100: {total_truncated}")
+        
+        print(f"  === END DEBUG ===\n")
     
     def _compute_size_metrics(self, predictions: List[Dict]) -> Dict[str, Any]:
         """Compute metrics by object size"""

@@ -49,10 +49,6 @@ def run_detector_on_dataset(detector, dataset, config: Dict[str, Any],
         sample = dataset[i]
         image_path = sample['image_path']
 
-        # print(f"***********************DEBUGGING***********************")
-        # print(f"image_path: {image_path}")
-        # print(f"***********************DEBUGGING***********************")
-        
         # Load image
         image = Image.open(image_path)
         

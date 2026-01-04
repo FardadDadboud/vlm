@@ -12,9 +12,10 @@ class VanillaAdapter(BaseAdapter):
     
     def __init__(self, detector, config: dict):
         super().__init__(detector, config)
+        self.iou_threshold = config['detector'].get('iou_threshold') or 0.3
     
     def adapt_and_detect(self, image: Image.Image, target_classes: List[str], threshold: float):
         """
         Run vanilla detection without any adaptation
         """
-        return self.detector.detect(image, target_classes, threshold)
+        return self.detector.detect(image, target_classes, threshold, self.iou_threshold)

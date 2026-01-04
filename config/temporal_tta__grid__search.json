@@ -1,0 +1,36 @@
+{
+    "description": "Grid search for Temporal TTA hyperparameters on SHIFT dataset",
+    
+    "base_config_path": "./configs/temporal_tta_config.json",
+    "output_dir": "./outputs/temporal_grid_search",
+    
+    "grid_params": {
+        "_comment": "Parameters to search over",
+        
+        "adaptation.params.kappa_trans": [10.0, 50.0, 100.0, 200.0],
+        "_kappa_trans_doc": "Higher = more temporal stability",
+        
+        "adaptation.params.kappa_ems": [5.0, 10.0, 25.0, 50.0],
+        "_kappa_ems_doc": "Higher = tighter class clusters",
+        
+        "adaptation.params.window_size": [3, 5, 10],
+        "_window_size_doc": "Frames to consider for EM",
+        
+        "adaptation.params.tau_update": [0.3, 0.5, 0.7],
+        "_tau_update_doc": "Confidence threshold for SSM update"
+    },
+    
+    "dataset_subset": {
+        "filters": {
+            "weather": ["clear", "fog"],
+            "time_of_day": ["daytime", "night"]
+        },
+        "max_samples": 500
+    },
+    
+    "execution": {
+        "gpu_memory_per_job_gb": 8.0,
+        "safety_margin_gb": 1.0,
+        "checkpoint_frequency": 10
+    }
+}

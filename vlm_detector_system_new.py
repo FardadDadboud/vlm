@@ -296,7 +296,9 @@ class GroundingDINODetector(BaseDetector):
         )
         print("✓ GroundingDINO (transformers) loaded successfully")
 
-    def detect(self, image: Image.Image, texts: List[str], threshold: float = 0.05) -> DetectionResult:
+    def detect(self, image: Image.Image, texts: List[str], threshold: float = 0.05, iou_threshold: float = 0.3) -> DetectionResult:
+
+        
         
         if not texts or not isinstance(texts, list): return DetectionResult([], [], [], "", self.model_path)
         
@@ -320,14 +322,17 @@ class GroundingDINODetector(BaseDetector):
                 scores_list = logits.cpu().numpy().tolist()
                 labels_list = phrases
 
-            else:  # Transformers - use manual model forward pass (same as _detect_transformers_with_features)
+            else:  # Transformers - use manual model forward pass with offset-span aggregation
                 model = self.model.model
                 image_processor = self.model.image_processor
                 tokenizer = self.model.tokenizer
                 
-                # Process image and text SEPARATELY
+                # Process image and text SEPARATELY (with offset mapping!)
                 image_inputs = image_processor(images=image, return_tensors="pt")
-                text_inputs = tokenizer(text_prompt, return_tensors="pt", padding=True, truncation=True)
+                text_inputs = tokenizer(text_prompt, return_tensors="pt", padding=True, truncation=True, return_offsets_mapping=True)
+                
+                # Save offset_mapping and remove from model inputs
+                offset_mapping = text_inputs.pop('offset_mapping')[0]  # (num_tokens, 2)
                 
                 # Combine inputs
                 inputs = {
@@ -338,34 +343,55 @@ class GroundingDINODetector(BaseDetector):
                 # Forward pass
                 with torch.no_grad():
                     outputs = model(**inputs)
-                
+
                 # Extract outputs
-                logits = outputs.logits[0].cpu().numpy()  # (num_queries, 256)
+                logits = outputs.logits[0].cpu().numpy()  # (num_queries, num_text_tokens)
                 pred_boxes = outputs.pred_boxes[0].cpu().numpy()  # (num_queries, 4)
                 
-                # Get tokenized text to find class token positions
-                tokens = tokenizer.convert_ids_to_tokens(text_inputs['input_ids'][0])
+                # ROBUST CLASS TOKEN EXTRACTION using offset-span aggregation
+                class_token_indices_list = []
                 
-                # Map each class to its token position
-                class_token_positions = []
                 for class_name in texts:
-                    try:
-                        pos = tokens.index(class_name)
-                        class_token_positions.append(pos)
-                    except ValueError:
-                        print(f"Warning: Could not find token position for class '{class_name}'")
-                        class_token_positions.append(0)
+                    # Find character span of this class in the text prompt
+                    start_char = text_prompt.find(class_name)
+                    if start_char == -1:
+                        print(f"Warning: Class '{class_name}' not found in prompt '{text_prompt}'")
+                        class_token_indices_list.append([0])
+                        continue
+                    
+                    end_char = start_char + len(class_name)
+                    
+                    # Find tokens whose offsets overlap with this class span
+                    token_indices = []
+                    for token_idx, (token_start, token_end) in enumerate(offset_mapping):
+                        # Check if token overlaps with class span
+                        if token_start < end_char and token_end > start_char and token_start != token_end:
+                            token_indices.append(token_idx)
+                    
+                    if len(token_indices) == 0:
+                        print(f"Warning: No tokens found for class '{class_name}', using fallback")
+                        token_indices = [0]
+                    
+                    class_token_indices_list.append(token_indices)
                 
-                # Extract class-specific logits: (num_queries, num_classes)
-                class_logits = logits[:, class_token_positions]
+                # Extract class-specific logits (aggregate multi-token classes with MAX)
+                num_queries = logits.shape[0]
+                num_classes = len(texts)
+                class_logits = np.zeros((num_queries, num_classes))
                 
-                # Apply sigmoid to get probabilities
-                class_probs = 1 / (1 + np.exp(-class_logits))  # (num_queries, num_classes)
+                for class_idx, token_indices in enumerate(class_token_indices_list):
+                    # Use MAX aggregation for multi-token classes
+                    class_logits[:, class_idx] = logits[:, token_indices].max(axis=1)
+                
+                # Apply softmax to get probabilities
+                class_probs = np.exp(class_logits - np.max(class_logits, axis=1, keepdims=True))
+                class_probs = class_probs / (np.sum(class_probs, axis=1, keepdims=True) + 1e-8)
                 
                 # Get max score and label for each query
                 all_scores = class_probs.max(axis=1)
                 all_label_indices = class_probs.argmax(axis=1)
                 all_labels = [texts[idx] for idx in all_label_indices]
+
                 
                 # Convert boxes to pixel coordinates
                 image_w, image_h = image.size
@@ -384,7 +410,7 @@ class GroundingDINODetector(BaseDetector):
                 
                 # Apply NMS to remove overlapping boxes
                 if boxes_list:
-                    keep_indices = self._nms_boxes(boxes_list, scores_list, iou_threshold=0.3)
+                    keep_indices = self._nms_boxes(boxes_list, scores_list, iou_threshold=iou_threshold)
                     boxes_list = [boxes_list[i] for i in keep_indices]
                     scores_list = [scores_list[i] for i in keep_indices]
                     labels_list = [labels_list[i] for i in keep_indices]
@@ -401,7 +427,7 @@ class GroundingDINODetector(BaseDetector):
             model_path=self.model_path
         )
 
-    def detect_with_features(self, image: Image.Image, texts: List[str], threshold: float = 0.05) -> DetectionResult:
+    def detect_with_features(self, image: Image.Image, texts: List[str], threshold: float = 0.05, alpha: float = 0.7) -> DetectionResult:
         """
         Extended detection that returns internal features from the model.
         Returns DetectionResult with features and class_probs populated.
@@ -417,9 +443,11 @@ class GroundingDINODetector(BaseDetector):
                 return self._detect_custom_with_features(image, text_prompt, texts, threshold)
             else:
                 # Transformers pipeline - extract features from underlying model
-                return self._detect_transformers_with_features(image, text_prompt, texts, threshold)
+                return self._detect_transformers_with_features(image, text_prompt, texts, threshold, alpha)
         except Exception as e:
-            print(f"Feature extraction error: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"Feature extraction error: {e} {traceback.format_exc()}")
             return DetectionResult([], [], [], "", self.model_path, None, 0.0, None, None)
 
     def _detect_custom_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float) -> DetectionResult:
@@ -517,22 +545,22 @@ class GroundingDINODetector(BaseDetector):
             class_probs=class_probs_array
         )
 
-    def _detect_transformers_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float) -> DetectionResult:
+    def _detect_transformers_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float, alpha: float = 0.7) -> DetectionResult:
         """
-        Extract ALL query features and scores.
+        Extract ALL query features and scores using forward hooks.
         
-        Uses SAME processing as detect() for fair comparison:
-        - Joint text prompt with ". " separator
-        - Separate image_processor and tokenizer
-        - Manual logit extraction at class token positions
+        DIAGNOSTIC: Hook with kwargs to see what class_embed receives.
         """
         model = self.model.model
         image_processor = self.model.image_processor
         tokenizer = self.model.tokenizer
         
-        # Process image and text SEPARATELY (same as detect method)
+        # Process image and text SEPARATELY (with offset mapping!)
         image_inputs = image_processor(images=image, return_tensors="pt")
-        text_inputs = tokenizer(text_prompt, return_tensors="pt", padding=True, truncation=True)
+        text_inputs = tokenizer(text_prompt, return_tensors="pt", padding=True, truncation=True, return_offsets_mapping=True)
+        
+        # Save offset_mapping and remove from model inputs
+        offset_mapping = text_inputs.pop('offset_mapping')[0]  # (num_tokens, 2)
         
         # Combine inputs
         inputs = {
@@ -540,38 +568,97 @@ class GroundingDINODetector(BaseDetector):
             **{k: v.to(self.device) for k, v in text_inputs.items()}
         }
         
+        # Setup hook with kwargs enabled
+        captured = {}
+        
+        def capture_pre_with_kwargs(module, args, kwargs):
+            """Capture vision_hidden_state from class_embed kwargs"""
+            if "vision_hidden_state" in kwargs:
+                captured["vision_hs"] = kwargs["vision_hidden_state"].detach()
+        
+        # Register PRE-hook with kwargs enabled
+        try:
+            hook_target = model.class_embed[-1] if isinstance(model.class_embed, torch.nn.ModuleList) else model.class_embed
+            handle = hook_target.register_forward_pre_hook(capture_pre_with_kwargs, with_kwargs=True)
+            hook_registered = True
+        except Exception as e:
+            print(f"Warning: Could not register hook: {e}")
+            handle = None
+            hook_registered = False
+        
         # Forward pass
         with torch.no_grad():
             outputs = model(**inputs, output_hidden_states=True, return_dict=True)
         
+        # Remove hook
+        if handle is not None:
+            handle.remove()
+        
         # Extract outputs
-        logits = outputs.logits[0]  # (num_queries, 256)
+        logits = outputs.logits[0]  # (num_queries, num_text_tokens)
         pred_boxes = outputs.pred_boxes[0]  # (num_queries, 4)
-        query_features = outputs.decoder_hidden_states[-1][0]  # (num_queries, hidden_dim)
+        
+        # Get query features from hook
+        if hook_registered and "vision_hs" in captured:
+            query_features = captured["vision_hs"]
+            # Handle batch dimension
+            if query_features.dim() == 3:
+                query_features = query_features[0]
+            
+            query_features_np = query_features.cpu().numpy()
+            # Note: These are class-agnostic decoder features
+            # Will create hybrid features after computing class_probs
+        else:
+            # Fallback to decoder hidden states
+            query_features = outputs.decoder_hidden_states[-1][0]
+            query_features_np = query_features.cpu().numpy()
+        
+        # Handle inf/nan values in features
+        query_features_np[np.isnan(query_features_np)] = 0
+        query_features_np[np.isinf(query_features_np)] = 0
         
         # Convert to numpy
         logits_np = logits.cpu().numpy()
         pred_boxes_np = pred_boxes.cpu().numpy()
-        query_features_np = query_features.cpu().numpy()
         
-        # Get tokenized text to find class token positions
-        tokens = tokenizer.convert_ids_to_tokens(text_inputs['input_ids'][0])
+        # ROBUST CLASS TOKEN EXTRACTION using offset-span aggregation
+        class_token_indices_list = []
         
-        # Map each class to its token position
-        class_token_positions = []
         for class_name in texts:
-            try:
-                pos = tokens.index(class_name)
-                class_token_positions.append(pos)
-            except ValueError:
-                print(f"Warning: Could not find token position for class '{class_name}'")
-                class_token_positions.append(0)
+            # Find character span of this class in the text prompt
+            start_char = text_prompt.find(class_name)
+            if start_char == -1:
+                print(f"Warning: Class '{class_name}' not found in prompt '{text_prompt}'")
+                class_token_indices_list.append([0])
+                continue
+            
+            end_char = start_char + len(class_name)
+            
+            # Find tokens whose offsets overlap with this class span
+            token_indices = []
+            for token_idx, (token_start, token_end) in enumerate(offset_mapping):
+                # Check if token overlaps with class span
+                if token_start < end_char and token_end > start_char and token_start != token_end:
+                    token_indices.append(token_idx)
+            
+            if len(token_indices) == 0:
+                print(f"Warning: No tokens found for class '{class_name}', using fallback")
+                token_indices = [0]
+            
+            class_token_indices_list.append(token_indices)
         
-        # Extract class-specific logits: (num_queries, num_classes)
-        class_logits = logits_np[:, class_token_positions]
+        # Extract class-specific logits (aggregate multi-token classes with MAX)
+        num_queries = logits_np.shape[0]
+        num_classes = len(texts)
+        class_logits = np.zeros((num_queries, num_classes))
         
-        # Apply sigmoid to get probabilities
-        class_probs = 1 / (1 + np.exp(-class_logits))  # (num_queries, num_classes)
+        for class_idx, token_indices in enumerate(class_token_indices_list):
+            # Use MAX aggregation for multi-token classes
+            class_logits[:, class_idx] = logits_np[:, token_indices].max(axis=1)
+        
+        # Apply softmax to get probabilities
+        class_probs = np.exp(class_logits - np.max(class_logits, axis=1, keepdims=True))
+        class_probs = class_probs / (np.sum(class_probs, axis=1, keepdims=True) + 1e-8)
         
         # Get max score and label for each query
         all_scores = class_probs.max(axis=1)
@@ -586,6 +673,18 @@ class GroundingDINODetector(BaseDetector):
         all_boxes_xyxy[:, 2] = (pred_boxes_np[:, 0] + pred_boxes_np[:, 2] / 2) * image_w
         all_boxes_xyxy[:, 3] = (pred_boxes_np[:, 1] + pred_boxes_np[:, 3] / 2) * image_h
         
+        # CREATE HYBRID FEATURES: decoder (spatial) + class_probs (semantic)
+        # GroundingDINO has no text projection layer - features are class-agnostic
+        # Hybrid approach adds class discrimination
+        decoder_norm = query_features_np / (np.linalg.norm(query_features_np, axis=1, keepdims=True) + 1e-8)
+        semantic_norm = class_probs / (np.linalg.norm(class_probs, axis=1, keepdims=True) + 1e-8)
+        
+        
+        query_features_np = np.concatenate([
+            (1 - alpha) * decoder_norm,
+            alpha * semantic_norm
+        ], axis=1)
+        
         result = DetectionResult(
             boxes=all_boxes_xyxy.tolist(),
             scores=all_scores.tolist(),
@@ -594,11 +693,13 @@ class GroundingDINODetector(BaseDetector):
             model_path=self.model_path,
             depth_map=None,
             processing_time=0.0,
-            features=query_features_np,
+            features=query_features_np,  # Hooked features from class_embed!
             class_probs=class_probs
         )
         
         return result
+
+
 
 
 class DETRDetector(BaseDetector):
