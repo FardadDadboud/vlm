@@ -14,11 +14,11 @@
   },
   "dataset_subset": {
     "filters": {
-      "weather": ["clear", "rainy", "overcast", "foggy", "cloudy"],
-      "time": ["daytime", "nighttime"],
+      "weather": ["cloudy"],
+      "time": ["night"],
       "max_frames_per_video": null
     },
     "max_samples": null
   },
-  "output_dir": "./shift_all_bca_plus_grid_search_results"
+  "output_dir": "./shift_cloudy_night_bca_plus_grid_search_results"
 }

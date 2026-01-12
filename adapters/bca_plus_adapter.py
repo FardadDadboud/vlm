@@ -340,22 +340,26 @@ class BCAPlusAdapter(BaseAdapter):
         
         # CASE 1: Cache is EMPTY - Batch-init with clustering
         if self.cache.is_empty():
-            print(f"***********************BATCH INIT***********************")
-            print(f"Initializing cache from {len(features)} high-confidence proposals")
+            # print(f"***********************BATCH INIT***********************")
+            # print(f"Initializing cache from {len(features)} high-confidence proposals")
             self._batch_init_cache(features, boxes, probs)
-            print(f"Cache initialized with M={self.cache.M} entries")
-            print(f"***********************BATCH INIT DONE***********************")
+            # print(f"Cache initialized with M={self.cache.M} entries")
+            # print(f"***********************BATCH INIT DONE***********************")
             return
         
         # CASE 2: Cache EXISTS - Use pre-computed P(U|x) for updates
-        print(f"***********************CACHE UPDATE***********************")
-        print(f"Updating cache (M={self.cache.M}) with {len(features)} proposals")
+        # print(f"***********************CACHE UPDATE***********************")
+        # print(f"Updating cache (M={self.cache.M}) with {len(features)} proposals")
         
         if P_U_given_x_all is None:
             print(f"WARNING: No pre-computed P(U|x) available, skipping cache update")
             return
         
+<<<<<<< Updated upstream
         # # DIAGNOSTIC: Check proposals vs cache similarities
+=======
+        # DIAGNOSTIC: Check proposals vs cache similarities
+>>>>>>> Stashed changes
         # print(f"\n{'='*60}")
         # print(f"CACHE UPDATE - PROPOSALS VS CACHE CROSS-SIMILARITY")
         # print(f"{'='*60}")
@@ -371,7 +375,11 @@ class BCAPlusAdapter(BaseAdapter):
         # print(f"  >0.80: {(cross_sims > 0.80).sum()} / {cross_sims.size} ({100*(cross_sims > 0.80).sum()/cross_sims.size:.1f}%)")
         # print(f"{'='*60}\n")
         
+<<<<<<< Updated upstream
         # # DIAGNOSTIC: Check cache distinctiveness
+=======
+        # DIAGNOSTIC: Check cache distinctiveness
+>>>>>>> Stashed changes
         # print(f"\n=== CACHE ANALYSIS ===")
         # if self.cache.M > 1:
         #     # Compute pairwise similarities between cache entries
@@ -467,8 +475,8 @@ class BCAPlusAdapter(BaseAdapter):
                 # print(f"  -> UPDATING cache entry {m_star} ({reason})")
                 self._update_cache_entry(m_star, feature, box, prob)
         
-        print(f"Cache update done: M={self.cache.M}")
-        print(f"***********************CACHE UPDATE DONE***********************")
+        # print(f"Cache update done: M={self.cache.M}")
+        # print(f"***********************CACHE UPDATE DONE***********************")
     
     def _batch_init_cache(self, features, boxes, probs):
         """
@@ -489,10 +497,10 @@ class BCAPlusAdapter(BaseAdapter):
         TAU2_INIT = self.tau2_init  # Higher than self.tau2 (typically 0.5)
         MAX_CLUSTER_SIZE = 50  # Limit cluster size to prevent over-averaging
         
-        print(f"Batch-init using TAU2_INIT={TAU2_INIT}, MAX_CLUSTER_SIZE={MAX_CLUSTER_SIZE}")
+        # print(f"Batch-init using TAU2_INIT={TAU2_INIT}, MAX_CLUSTER_SIZE={MAX_CLUSTER_SIZE}")
         
         # Get predicted class for each proposal
-        print(f"probs shape: {probs.shape}")
+        # print(f"probs shape: {probs.shape}")
         predicted_classes = np.argmax(probs, axis=1)
         
         # Process each class separately

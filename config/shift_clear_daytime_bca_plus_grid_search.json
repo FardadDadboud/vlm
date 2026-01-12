@@ -1,11 +1,11 @@
 {
   "base_config_path": "config/bca_plus.json",
   "grid_params": {
-    "adaptation.params.tau1": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-    "adaptation.params.tau2": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-    "adaptation.params.ws": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-    "adaptation.params.logit_temperature": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-    "adaptation.params.alpha": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    "adaptation.params.tau1": [0.8, 0.7, 0.6, 0.5],
+    "adaptation.params.tau2": [0.8, 0.7, 0.6, 0.5],
+    "adaptation.params.ws": [0.1, 0.2, 0.3, 0.4, 0.5],
+    "adaptation.params.logit_temperature": [1.0, 3.0, 6.0, 9.0, 12.0],
+    "adaptation.params.alpha": [0.1, 0.3, 0.5, 0.7, 0.9]
   },
   "execution": {
     "gpu_memory_per_job_gb": 4.0,
