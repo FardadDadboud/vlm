@@ -375,11 +375,7 @@ class BCAPlusAdapter(BaseAdapter):
         # print(f"  >0.80: {(cross_sims > 0.80).sum()} / {cross_sims.size} ({100*(cross_sims > 0.80).sum()/cross_sims.size:.1f}%)")
         # print(f"{'='*60}\n")
         
-<<<<<<< Updated upstream
-        # # DIAGNOSTIC: Check cache distinctiveness
-=======
         # DIAGNOSTIC: Check cache distinctiveness
->>>>>>> Stashed changes
         # print(f"\n=== CACHE ANALYSIS ===")
         # if self.cache.M > 1:
         #     # Compute pairwise similarities between cache entries
