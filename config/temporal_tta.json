@@ -6,7 +6,7 @@
     "output_dir": "./shift_temporal_tta_results",
     
     "filters": {
-        "weather": ["clear"],
+        "weather": ["clear", "rainy", "overcast", "foggy", "cloudy"],
         "time": ["daytime"],
         "max_frames_per_video": null
     },
@@ -18,37 +18,27 @@
         "model_path": "IDEA-Research/grounding-dino-base",
         "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
         "threshold": 0.10,
-        "iou_threshold": 0.3
+        "iou_threshold": 0.7
     },
     
     "adaptation": {
-        "type": "temporal",
-        "params": {
-            "_comment": "STAD-vMF parameters from the paper",
-            
-            "kappa_trans": 50.0,
-            "_kappa_trans_doc": "Transition concentration: higher = prototypes change more slowly between frames. Paper default: 50-100",
-            
-            "kappa_ems": 10.0,
-            "_kappa_ems_doc": "Emission concentration: higher = tighter clusters. Paper default: 10-50",
-            
-            "window_size": 5,
-            "_window_size_doc": "Sliding window size for EM. Paper uses 5-10",
-            
-            "em_iterations": 3,
-            "_em_iterations_doc": "EM iterations per frame. Paper uses 3-5",
-            
-            "tau_update": 0.5,
-            "_tau_update_doc": "Minimum confidence to include detection in SSM update",
-            
-            "tau_predict": 0.3,
-            "_tau_predict_doc": "Minimum confidence threshold for final predictions",
-
-            "fusion_mode": "entropy",
-            "_fusion_mode_doc": "How to fuse VLM and prototype predictions: 'entropy' (uncertainty-weighted), 'weighted' (fixed weight), 'prototype_only', 'vlm_only'",
-      
-            "fusion_weight": 0.5,
-            "_fusion_weight_doc": "Weight for prototype predictions vs VLM predictions (not used if entropy fusion enabled)"
-        }
+    "type": "temporal",
+    "params": {
+      "kappa_trans": 50.0,
+      "kappa_ems": 10.0,
+      "window_size": 5,
+      "em_iterations": 3,
+      "tau_update": 0.7,
+      "fusion_mode": "entropy",
+      "alpha": 0.0,
+      "temperature": 15.0,
+      "use_ema_kappa": true,
+      "kappa_ema": 0.9,
+      "update_after_nms": true,
+      "debug_mode": true
     }
+  },
+  "reset_on_video_change": true,
+  "process_by_video": true
+
 }

@@ -59,16 +59,16 @@ DETIC_AVAILABLE = DEPTH_AVAILABLE
 
 @dataclass
 class DetectionResult:
-    """Data class to store detection results"""
-    boxes: List[List[float]]  # [x1, y1, x2, y2]
+    boxes: List[List[float]]
     scores: List[float]
     labels: List[str]
-    image_path: str
-    model_path: str
-    depth_map: Any = None  # Optional depth information
-    processing_time: float = 0.0
-    features: Any = None  # Optional features (numpy array)
-    class_probs: Any = None  # Optional class probabilities (numpy array)
+    image_path: str = ""
+    model_path: str = ""
+    features: Optional[np.ndarray] = None           # Hybrid 262D
+    class_probs: Optional[np.ndarray] = None
+    text_embeddings: Optional[np.ndarray] = None    # Hybrid 262D
+    raw_features: Optional[np.ndarray] = None       # Raw 256D (NEW)
+    raw_text_embeddings: Optional[np.ndarray] = None  # Raw 256D (NEW)
 
 
 class BaseDetector(ABC):
@@ -566,9 +566,8 @@ class GroundingDINODetector(BaseDetector):
 
     def _detect_transformers_with_features(self, image: Image.Image, text_prompt: str, texts: List[str], threshold: float, alpha: float = 0.7) -> DetectionResult:
         """
-        Extract ALL query features and scores using forward hooks.
-        
-        DIAGNOSTIC: Hook with kwargs to see what class_embed receives.
+        Extract ALL query features, scores, and text embeddings.
+        Returns hybrid features for both queries and text prototypes.
         """
         model = self.model.model
         image_processor = self.model.image_processor
@@ -614,21 +613,16 @@ class GroundingDINODetector(BaseDetector):
             handle.remove()
         
         # Extract outputs
-        logits = outputs.logits[0]  # (num_queries, num_text_tokens)
+        logits = outputs.logits[0]  # (num_queries, max_text_tokens)
         pred_boxes = outputs.pred_boxes[0]  # (num_queries, 4)
         
         # Get query features from hook
         if hook_registered and "vision_hs" in captured:
             query_features = captured["vision_hs"]
-            # Handle batch dimension
             if query_features.dim() == 3:
                 query_features = query_features[0]
-            
             query_features_np = query_features.cpu().numpy()
-            # Note: These are class-agnostic decoder features
-            # Will create hybrid features after computing class_probs
         else:
-            # Fallback to decoder hidden states
             query_features = outputs.decoder_hidden_states[-1][0]
             query_features_np = query_features.cpu().numpy()
         
@@ -636,15 +630,18 @@ class GroundingDINODetector(BaseDetector):
         query_features_np[np.isnan(query_features_np)] = 0
         query_features_np[np.isinf(query_features_np)] = 0
         
+        # Extract text features for prototypes
+        text_features = outputs.encoder_last_hidden_state_text[0].cpu().numpy()  # (num_tokens, 256)
+        
         # Convert to numpy
         logits_np = logits.cpu().numpy()
         pred_boxes_np = pred_boxes.cpu().numpy()
         
         # ROBUST CLASS TOKEN EXTRACTION using offset-span aggregation
         class_token_indices_list = []
+        num_classes = len(texts)
         
         for class_name in texts:
-            # Find character span of this class in the text prompt
             start_char = text_prompt.find(class_name)
             if start_char == -1:
                 print(f"Warning: Class '{class_name}' not found in prompt '{text_prompt}'")
@@ -653,10 +650,8 @@ class GroundingDINODetector(BaseDetector):
             
             end_char = start_char + len(class_name)
             
-            # Find tokens whose offsets overlap with this class span
             token_indices = []
             for token_idx, (token_start, token_end) in enumerate(offset_mapping):
-                # Check if token overlaps with class span
                 if token_start < end_char and token_end > start_char and token_start != token_end:
                     token_indices.append(token_idx)
             
@@ -668,11 +663,9 @@ class GroundingDINODetector(BaseDetector):
         
         # Extract class-specific logits (aggregate multi-token classes with MAX)
         num_queries = logits_np.shape[0]
-        num_classes = len(texts)
         class_logits = np.zeros((num_queries, num_classes))
         
         for class_idx, token_indices in enumerate(class_token_indices_list):
-            # Use MAX aggregation for multi-token classes
             class_logits[:, class_idx] = logits_np[:, token_indices].max(axis=1)
         
         # Apply softmax to get probabilities
@@ -692,33 +685,57 @@ class GroundingDINODetector(BaseDetector):
         all_boxes_xyxy[:, 2] = (pred_boxes_np[:, 0] + pred_boxes_np[:, 2] / 2) * image_w
         all_boxes_xyxy[:, 3] = (pred_boxes_np[:, 1] + pred_boxes_np[:, 3] / 2) * image_h
         
-        # CREATE HYBRID FEATURES: decoder (spatial) + class_probs (semantic)
-        # GroundingDINO has no text projection layer - features are class-agnostic
-        # Hybrid approach adds class discrimination
-        decoder_norm = query_features_np / (np.linalg.norm(query_features_np, axis=1, keepdims=True) + 1e-8)
-        semantic_norm = class_probs / (np.linalg.norm(class_probs, axis=1, keepdims=True) + 1e-8)
+        # Store raw decoder features BEFORE hybrid mixing
+        raw_decoder_norm = query_features_np / (np.linalg.norm(query_features_np, axis=1, keepdims=True) + 1e-8)
+
+        # Create hybrid features for prediction
+        if alpha > 0:
+            semantic_norm = class_probs / (np.linalg.norm(class_probs, axis=1, keepdims=True) + 1e-8)
+            hybrid_features = np.concatenate([
+                (1 - alpha) * raw_decoder_norm,
+                alpha * semantic_norm
+            ], axis=1)
+        else:
+            hybrid_features = raw_decoder_norm
+
+        # query_features_np is now hybrid (used for existing code paths)
+        query_features_np = hybrid_features
         
         
-        query_features_np = np.concatenate([
-            (1 - alpha) * decoder_norm,
-            alpha * semantic_norm
-        ], axis=1)
+        # CREATE HYBRID TEXT EMBEDDINGS: text (spatial) + one_hot (semantic)
+        raw_text_embeddings = np.zeros((num_classes, text_features.shape[1]))
+        for k, token_indices in enumerate(class_token_indices_list):
+            raw_text_embeddings[k] = text_features[token_indices].mean(axis=0)
         
-        result = DetectionResult(
+        # Store raw text embeddings
+        raw_text_norm = raw_text_embeddings / (np.linalg.norm(raw_text_embeddings, axis=1, keepdims=True) + 1e-8)
+
+        # Create hybrid text embeddings for prediction
+        if alpha > 0:
+            one_hot = np.eye(num_classes)
+            one_hot_norm = one_hot / (np.linalg.norm(one_hot, axis=1, keepdims=True) + 1e-8)
+            hybrid_text_embeddings = np.concatenate([
+                (1 - alpha) * raw_text_norm,
+                alpha * one_hot_norm
+            ], axis=1)
+        else:
+            hybrid_text_embeddings = raw_text_norm
+
+        # This is used for existing code paths
+        text_embeddings = hybrid_text_embeddings
+        
+        return DetectionResult(
             boxes=all_boxes_xyxy.tolist(),
             scores=all_scores.tolist(),
             labels=all_labels,
             image_path="",
             model_path=self.model_path,
-            depth_map=None,
-            processing_time=0.0,
-            features=query_features_np,  # Hooked features from class_embed!
-            class_probs=class_probs
+            features=query_features_np,
+            class_probs=class_probs,
+            text_embeddings=text_embeddings,  # NEW: hybrid prototypes
+            raw_features=raw_decoder_norm,
+            raw_text_embeddings=raw_text_norm
         )
-        
-        return result
-
-
 
 
 class DETRDetector(BaseDetector):

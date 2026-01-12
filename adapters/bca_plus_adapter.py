@@ -27,6 +27,8 @@ class BCAPlusAdapter(BaseAdapter):
         params = config['adaptation']['params']
         self.tau1 = params.get('tau1') or 0.7
         self.tau2 = params.get('tau2') or 0.8
+        self.tau2_init = params.get('tau2_init') or 0.5
+        self.max_cache_size = params.get('max_cache_size') or 50
         self.ws = params.get('ws') or 0.2
         self.logit_temperature = params.get('logit_temperature') or 1.0
         self.alpha = params.get('alpha') or 0.7
@@ -161,6 +163,8 @@ class BCAPlusAdapter(BaseAdapter):
             # Cache-based prediction
             cache_probs_i = P_U_given_x @ self.cache.V_cache.T
             
+            
+            
             # Fuse initial and cache predictions
             final_probs[i] = self._uncertainty_fusion_single(init_probs[i], cache_probs_i)
 
@@ -191,6 +195,14 @@ class BCAPlusAdapter(BaseAdapter):
         # Weights based on confidence (lower entropy = higher weight)
         w_init = np.exp(-E_init)
         w_cache = np.exp(-E_cache)
+
+        if np.isinf(w_init) or np.isinf(w_cache):
+            print(f"w_init: {w_init}, w_cache: {w_cache}")
+            print(f"E_init: {E_init}, E_cache: {E_cache}")
+            print(f"init_prob: {init_prob}, cache_prob: {cache_prob}")
+            exit()
+
+        
         
         # Weighted fusion
         fused = (w_init * init_prob + w_cache * cache_prob) / (w_init + w_cache)
@@ -218,6 +230,9 @@ class BCAPlusAdapter(BaseAdapter):
         
         
         # Softmax to get posterior
+        if len(likelihood) == 1:
+            return likelihood
+        likelihood = likelihood * self.logit_temperature
         P_U_given_x = self._softmax(likelihood)
 
         
@@ -239,8 +254,6 @@ class BCAPlusAdapter(BaseAdapter):
         # F_cache is (d, M), feature_norm is (d,)
         # Correct: feature_norm @ F_cache = (d,) @ (d, M) = (M,)
         similarities = feature_norm @ self.cache.F_cache  # (M,)
-        # multiply by a logit temperature
-        similarities = similarities * self.logit_temperature
 
         return similarities
     
@@ -342,72 +355,72 @@ class BCAPlusAdapter(BaseAdapter):
             print(f"WARNING: No pre-computed P(U|x) available, skipping cache update")
             return
         
-        # DIAGNOSTIC: Check proposals vs cache similarities
-        print(f"\n{'='*60}")
-        print(f"CACHE UPDATE - PROPOSALS VS CACHE CROSS-SIMILARITY")
-        print(f"{'='*60}")
-        # Normalize proposals
-        proposal_norms = np.linalg.norm(features, axis=1, keepdims=True)
-        proposals_norm = features / (proposal_norms + 1e-8)
-        # Cache is already normalized
-        cross_sims = proposals_norm @ self.cache.F_cache  # (N_proposals, M_cache)
-        print(f"Cross-similarity matrix shape: {cross_sims.shape}")
-        print(f"Cross-similarities: min={cross_sims.min():.6f}, max={cross_sims.max():.6f}, mean={cross_sims.mean():.6f}")
-        print(f"  >0.95: {(cross_sims > 0.95).sum()} / {cross_sims.size} ({100*(cross_sims > 0.95).sum()/cross_sims.size:.1f}%)")
-        print(f"  >0.90: {(cross_sims > 0.90).sum()} / {cross_sims.size} ({100*(cross_sims > 0.90).sum()/cross_sims.size:.1f}%)")
-        print(f"  >0.80: {(cross_sims > 0.80).sum()} / {cross_sims.size} ({100*(cross_sims > 0.80).sum()/cross_sims.size:.1f}%)")
-        print(f"{'='*60}\n")
+        # # DIAGNOSTIC: Check proposals vs cache similarities
+        # print(f"\n{'='*60}")
+        # print(f"CACHE UPDATE - PROPOSALS VS CACHE CROSS-SIMILARITY")
+        # print(f"{'='*60}")
+        # # Normalize proposals
+        # proposal_norms = np.linalg.norm(features, axis=1, keepdims=True)
+        # proposals_norm = features / (proposal_norms + 1e-8)
+        # # Cache is already normalized
+        # cross_sims = proposals_norm @ self.cache.F_cache  # (N_proposals, M_cache)
+        # print(f"Cross-similarity matrix shape: {cross_sims.shape}")
+        # print(f"Cross-similarities: min={cross_sims.min():.6f}, max={cross_sims.max():.6f}, mean={cross_sims.mean():.6f}")
+        # print(f"  >0.95: {(cross_sims > 0.95).sum()} / {cross_sims.size} ({100*(cross_sims > 0.95).sum()/cross_sims.size:.1f}%)")
+        # print(f"  >0.90: {(cross_sims > 0.90).sum()} / {cross_sims.size} ({100*(cross_sims > 0.90).sum()/cross_sims.size:.1f}%)")
+        # print(f"  >0.80: {(cross_sims > 0.80).sum()} / {cross_sims.size} ({100*(cross_sims > 0.80).sum()/cross_sims.size:.1f}%)")
+        # print(f"{'='*60}\n")
         
-        # DIAGNOSTIC: Check cache distinctiveness
-        print(f"\n=== CACHE ANALYSIS ===")
-        if self.cache.M > 1:
-            # Compute pairwise similarities between cache entries
-            cache_sims = self.cache.F_cache.T @ self.cache.F_cache  # (M, M)
-            # Get upper triangle (excluding diagonal)
-            triu_indices = np.triu_indices(self.cache.M, k=1)
-            pairwise_sims = cache_sims[triu_indices]
+        # # DIAGNOSTIC: Check cache distinctiveness
+        # print(f"\n=== CACHE ANALYSIS ===")
+        # if self.cache.M > 1:
+        #     # Compute pairwise similarities between cache entries
+        #     cache_sims = self.cache.F_cache.T @ self.cache.F_cache  # (M, M)
+        #     # Get upper triangle (excluding diagonal)
+        #     triu_indices = np.triu_indices(self.cache.M, k=1)
+        #     pairwise_sims = cache_sims[triu_indices]
             
-            print(f"Overall inter-cache similarities (N={len(pairwise_sims)} pairs):")
-            print(f"  Min:  {pairwise_sims.min():.3f}")
-            print(f"  Max:  {pairwise_sims.max():.3f}")
-            print(f"  Mean: {pairwise_sims.mean():.3f}")
-            print(f"  >0.9: {(pairwise_sims > 0.9).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.9).mean():.1f}%)")
-            print(f"  >0.8: {(pairwise_sims > 0.8).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.8).mean():.1f}%)")
+        #     print(f"Overall inter-cache similarities (N={len(pairwise_sims)} pairs):")
+        #     print(f"  Min:  {pairwise_sims.min():.3f}")
+        #     print(f"  Max:  {pairwise_sims.max():.3f}")
+        #     print(f"  Mean: {pairwise_sims.mean():.3f}")
+        #     print(f"  >0.9: {(pairwise_sims > 0.9).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.9).mean():.1f}%)")
+        #     print(f"  >0.8: {(pairwise_sims > 0.8).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.8).mean():.1f}%)")
             
-            # CRITICAL: Analyze PER-CLASS similarities (this reveals the hidden problem!)
-            print(f"\nPer-class analysis (may reveal hidden within-class similarity):")
-            # Get predicted class for each cache entry
-            cache_classes = np.argmax(self.cache.V_cache.T, axis=1)  # (M,)
+        #     # CRITICAL: Analyze PER-CLASS similarities (this reveals the hidden problem!)
+        #     print(f"\nPer-class analysis (may reveal hidden within-class similarity):")
+        #     # Get predicted class for each cache entry
+        #     cache_classes = np.argmax(self.cache.V_cache.T, axis=1)  # (M,)
             
-            for class_idx in range(self.num_classes):
-                class_mask = cache_classes == class_idx
-                class_count = class_mask.sum()
+        #     for class_idx in range(self.num_classes):
+        #         class_mask = cache_classes == class_idx
+        #         class_count = class_mask.sum()
                 
-                if class_count > 1:
-                    # Get indices of this class
-                    class_indices = np.where(class_mask)[0]
+        #         if class_count > 1:
+        #             # Get indices of this class
+        #             class_indices = np.where(class_mask)[0]
                     
-                    # Compute within-class similarities
-                    within_class_sims = []
-                    for i in range(len(class_indices)):
-                        for j in range(i+1, len(class_indices)):
-                            sim = cache_sims[class_indices[i], class_indices[j]]
-                            within_class_sims.append(sim)
+        #             # Compute within-class similarities
+        #             within_class_sims = []
+        #             for i in range(len(class_indices)):
+        #                 for j in range(i+1, len(class_indices)):
+        #                     sim = cache_sims[class_indices[i], class_indices[j]]
+        #                     within_class_sims.append(sim)
                     
-                    within_class_sims = np.array(within_class_sims)
-                    print(f"  {self.class_names[class_idx]} (n={class_count}):")
-                    print(f"    Within-class mean: {within_class_sims.mean():.3f}")
-                    print(f"    Within-class max:  {within_class_sims.max():.3f}")
-                    print(f"    Within-class >0.9: {(within_class_sims > 0.9).sum()}/{len(within_class_sims)} ({100*(within_class_sims > 0.9).mean():.1f}%)")
+        #             within_class_sims = np.array(within_class_sims)
+        #             print(f"  {self.class_names[class_idx]} (n={class_count}):")
+        #             print(f"    Within-class mean: {within_class_sims.mean():.3f}")
+        #             print(f"    Within-class max:  {within_class_sims.max():.3f}")
+        #             print(f"    Within-class >0.9: {(within_class_sims > 0.9).sum()}/{len(within_class_sims)} ({100*(within_class_sims > 0.9).mean():.1f}%)")
                     
-                    if within_class_sims.mean() > 0.90:
-                        print(f"    ⚠️  CRITICAL: {self.class_names[class_idx]} entries TOO SIMILAR!")
-                        print(f"        This causes uniform posteriors for {self.class_names[class_idx]} detections!")
+        #             if within_class_sims.mean() > 0.90:
+        #                 print(f"    ⚠️  CRITICAL: {self.class_names[class_idx]} entries TOO SIMILAR!")
+        #                 print(f"        This causes uniform posteriors for {self.class_names[class_idx]} detections!")
             
-            if pairwise_sims.mean() > 0.85:
-                print(f"\n  ⚠️  WARNING: Cache entries are VERY similar (mean={pairwise_sims.mean():.3f})")
-                print(f"      This causes uniform posteriors → always creates new entries!")
-        print(f"===================\n")
+        #     if pairwise_sims.mean() > 0.85:
+        #         print(f"\n  ⚠️  WARNING: Cache entries are VERY similar (mean={pairwise_sims.mean():.3f})")
+        #         print(f"      This causes uniform posteriors → always creates new entries!")
+        # print(f"===================\n")
         
         # Process each proposal using PRE-COMPUTED P(U|x)
         for i in range(len(features)):
@@ -424,7 +437,7 @@ class BCAPlusAdapter(BaseAdapter):
             
             # Show both posterior and raw similarity for debugging
             raw_sim_info = f", raw_sim={raw_sim:.3f}" if raw_sim is not None else ""
-            print(f"Proposal {i}: m_star={m_star}, P(U|x)={s_star:.4f}{raw_sim_info}, tau2={self.tau2}, prob={prob}, P(U|x)={P_U_given_x}, raw_sims={raw_sims}, raw_sim_mean_sub={raw_sims - np.max(raw_sims)}, softmax_raw_sims={np.exp(raw_sims - np.max(raw_sims)) / np.sum(np.exp(raw_sims - np.max(raw_sims)))}")
+            # print(f"Proposal {i}: m_star={m_star}, P(U|x)={s_star:.4f}{raw_sim_info}, tau2={self.tau2}, prob={prob}, P(U|x)={P_U_given_x}, raw_sims={raw_sims}, raw_sim_mean_sub={raw_sims - np.max(raw_sims)}, softmax_raw_sims={np.exp(raw_sims - np.max(raw_sims)) / np.sum(np.exp(raw_sims - np.max(raw_sims)))}")
             
             # Cache update decision based on posterior
             # Paper: Compare P(U|x) to tau2
@@ -442,16 +455,16 @@ class BCAPlusAdapter(BaseAdapter):
             
             if should_create_new:
                 # Check cache size limit (safety net against infinite growth)
-                MAX_CACHE_SIZE = 50  # Reasonable limit for 6 classes
+                MAX_CACHE_SIZE = self.max_cache_size  # Reasonable limit for 6 classes
                 
                 if self.cache.M >= MAX_CACHE_SIZE:
-                    print(f"  -> CACHE FULL (M={self.cache.M}/{MAX_CACHE_SIZE}), UPDATING entry {m_star} instead")
+                    # print(f"  -> CACHE FULL (M={self.cache.M}/{MAX_CACHE_SIZE}), UPDATING entry {m_star} instead")
                     self._update_cache_entry(m_star, feature, box, prob)
                 else:
-                    print(f"  -> Creating NEW cache entry ({reason})")
+                    # print(f"  -> Creating NEW cache entry ({reason})")
                     self._create_cache_entry(feature, box, prob)
             else:
-                print(f"  -> UPDATING cache entry {m_star} ({reason})")
+                # print(f"  -> UPDATING cache entry {m_star} ({reason})")
                 self._update_cache_entry(m_star, feature, box, prob)
         
         print(f"Cache update done: M={self.cache.M}")
@@ -473,7 +486,7 @@ class BCAPlusAdapter(BaseAdapter):
         """
         # CRITICAL: Use stricter threshold for batch-init clustering
         # This prevents over-averaging many proposals into generic clusters
-        TAU2_INIT = self.tau2  # Higher than self.tau2 (typically 0.5)
+        TAU2_INIT = self.tau2_init  # Higher than self.tau2 (typically 0.5)
         MAX_CLUSTER_SIZE = 50  # Limit cluster size to prevent over-averaging
         
         print(f"Batch-init using TAU2_INIT={TAU2_INIT}, MAX_CLUSTER_SIZE={MAX_CLUSTER_SIZE}")
@@ -553,7 +566,7 @@ class BCAPlusAdapter(BaseAdapter):
                     cluster['centroid_scale'] = ((n-1) * cluster['centroid_scale'] + scale) / n
                     cluster['total_prob'] += prob
                     
-                    print(f"    Proposal {idx}: Added to cluster {best_cluster_idx} (size={n}, feat_sim={feat_sim:.3f}, scale_sim={scale_sim:.3f}, combined_sim={best_sim:.3f}, prob={prob})")
+                    # print(f"    Proposal {idx}: Added to cluster {best_cluster_idx} (size={n}, feat_sim={feat_sim:.3f}, scale_sim={scale_sim:.3f}, combined_sim={best_sim:.3f}, prob={prob})")
                 else:
                     # Create new cluster
                     clusters.append({
@@ -565,9 +578,9 @@ class BCAPlusAdapter(BaseAdapter):
                     
                     if best_cluster_idx >= 0:
                         reason = f"cluster full ({len(clusters[best_cluster_idx]['indices'])}/{MAX_CLUSTER_SIZE})" if best_sim >= TAU2_INIT else f"low sim ({best_sim:.3f} < {TAU2_INIT})"
-                        print(f"    Proposal {idx}: New cluster {len(clusters)-1} ({reason}), feat_sim={feat_sim:.3f}, scale_sim={scale_sim:.3f}, combined_sim={best_sim:.3f}, prob={prob}")
-                    else:
-                        print(f"    Proposal {idx}: First cluster, prob={prob}")
+                        # print(f"    Proposal {idx}: New cluster {len(clusters)-1} ({reason}), feat_sim={feat_sim:.3f}, scale_sim={scale_sim:.3f}, combined_sim={best_sim:.3f}, prob={prob}")
+                    # else:
+                        # print(f"    Proposal {idx}: First cluster, prob={prob}")
             
             # Create cache entries from clusters
             for cluster in clusters:
@@ -584,68 +597,68 @@ class BCAPlusAdapter(BaseAdapter):
                 # Set count to cluster size
                 self.cache.C_cache[-1] = n
                 
-                print(f"  Class {self.class_names[class_idx]}: Created cluster with {n} proposals (avg_prob={np.max(mean_prob):.3f})")
+                # print(f"  Class {self.class_names[class_idx]}: Created cluster with {n} proposals (avg_prob={np.max(mean_prob):.3f})")
         
-        print(f"\nTotal clusters created: {self.cache.M}")
-        if self.cache.M > 0:
-            print(f"Cluster size distribution: min={min([c for c in self.cache.C_cache])}, max={max([c for c in self.cache.C_cache])}, mean={np.mean(self.cache.C_cache):.1f}")
+        # print(f"\nTotal clusters created: {self.cache.M}")
+        # if self.cache.M > 0:
+            # print(f"Cluster size distribution: min={min([c for c in self.cache.C_cache])}, max={max([c for c in self.cache.C_cache])}, mean={np.mean(self.cache.C_cache):.1f}")
         
         
         # DIAGNOSTIC: Check if created clusters are actually distinct
-        if self.cache.M > 1:
-            print(f"\n=== CLUSTER DISTINCTIVENESS ANALYSIS ===")
-            # Compute pairwise similarities between cluster centroids
-            cluster_sims = self.cache.F_cache.T @ self.cache.F_cache  # (M, M)
-            # Get upper triangle (excluding diagonal)
-            triu_indices = np.triu_indices(self.cache.M, k=1)
-            pairwise_sims = cluster_sims[triu_indices]
+        # if self.cache.M > 1:
+        #     print(f"\n=== CLUSTER DISTINCTIVENESS ANALYSIS ===")
+        #     # Compute pairwise similarities between cluster centroids
+        #     cluster_sims = self.cache.F_cache.T @ self.cache.F_cache  # (M, M)
+        #     # Get upper triangle (excluding diagonal)
+        #     triu_indices = np.triu_indices(self.cache.M, k=1)
+        #     pairwise_sims = cluster_sims[triu_indices]
             
-            print(f"Overall inter-cluster similarities (N={len(pairwise_sims)} pairs):")
-            print(f"  Min:  {pairwise_sims.min():.3f}")
-            print(f"  Max:  {pairwise_sims.max():.3f}")
-            print(f"  Mean: {pairwise_sims.mean():.3f}")
-            print(f"  >0.9: {(pairwise_sims > 0.9).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.9).mean():.1f}%)")
-            print(f"  >0.8: {(pairwise_sims > 0.8).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.8).mean():.1f}%)")
-            print(f"  >0.7: {(pairwise_sims > 0.7).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.7).mean():.1f}%)")
+        #     print(f"Overall inter-cluster similarities (N={len(pairwise_sims)} pairs):")
+        #     print(f"  Min:  {pairwise_sims.min():.3f}")
+        #     print(f"  Max:  {pairwise_sims.max():.3f}")
+        #     print(f"  Mean: {pairwise_sims.mean():.3f}")
+        #     print(f"  >0.9: {(pairwise_sims > 0.9).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.9).mean():.1f}%)")
+        #     print(f"  >0.8: {(pairwise_sims > 0.8).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.8).mean():.1f}%)")
+        #     print(f"  >0.7: {(pairwise_sims > 0.7).sum()}/{len(pairwise_sims)} ({100*(pairwise_sims > 0.7).mean():.1f}%)")
             
-            # CRITICAL: Analyze PER-CLASS similarities
-            print(f"\nPer-class analysis (reveals within-class similarity):")
-            cluster_classes = np.argmax(self.cache.V_cache.T, axis=1)  # (M,)
+        #     # CRITICAL: Analyze PER-CLASS similarities
+        #     print(f"\nPer-class analysis (reveals within-class similarity):")
+        #     cluster_classes = np.argmax(self.cache.V_cache.T, axis=1)  # (M,)
             
-            for class_idx in range(self.num_classes):
-                class_mask = cluster_classes == class_idx
-                class_count = class_mask.sum()
+        #     for class_idx in range(self.num_classes):
+        #         class_mask = cluster_classes == class_idx
+        #         class_count = class_mask.sum()
                 
-                if class_count > 1:
-                    class_indices = np.where(class_mask)[0]
+        #         if class_count > 1:
+        #             class_indices = np.where(class_mask)[0]
                     
-                    # Compute within-class similarities
-                    within_class_sims = []
-                    for i in range(len(class_indices)):
-                        for j in range(i+1, len(class_indices)):
-                            sim = cluster_sims[class_indices[i], class_indices[j]]
-                            within_class_sims.append(sim)
+        #             # Compute within-class similarities
+        #             within_class_sims = []
+        #             for i in range(len(class_indices)):
+        #                 for j in range(i+1, len(class_indices)):
+        #                     sim = cluster_sims[class_indices[i], class_indices[j]]
+        #                     within_class_sims.append(sim)
                     
-                    within_class_sims = np.array(within_class_sims)
-                    print(f"  {self.class_names[class_idx]} (n={class_count}):")
-                    print(f"    Within-class mean: {within_class_sims.mean():.3f}")
-                    print(f"    Within-class >0.9: {(within_class_sims > 0.9).sum()}/{len(within_class_sims)} ({100*(within_class_sims > 0.9).mean():.1f}%)")
+        #             within_class_sims = np.array(within_class_sims)
+        #             print(f"  {self.class_names[class_idx]} (n={class_count}):")
+        #             print(f"    Within-class mean: {within_class_sims.mean():.3f}")
+        #             print(f"    Within-class >0.9: {(within_class_sims > 0.9).sum()}/{len(within_class_sims)} ({100*(within_class_sims > 0.9).mean():.1f}%)")
                     
-                    if within_class_sims.mean() > 0.90:
-                        print(f"    ⚠️  WARNING: {self.class_names[class_idx]} clusters TOO SIMILAR!")
+        #             if within_class_sims.mean() > 0.90:
+        #                 print(f"    ⚠️  WARNING: {self.class_names[class_idx]} clusters TOO SIMILAR!")
             
-            if pairwise_sims.mean() > 0.85:
-                print(f"\n  ⚠️  PROBLEM IDENTIFIED: Clusters are TOO SIMILAR (mean={pairwise_sims.mean():.3f})")
-                print(f"      Cause: Same scene → similar backgrounds/features")
-                print(f"      Effect: Uniform posteriors → always P(U|x) < tau2 → infinite growth")
-                print(f"      Solution: Need LOWER tau2 or HIGHER TAU2_INIT")
-            elif pairwise_sims.mean() > 0.70:
-                print(f"\n  ⚠️  WARNING: Clusters are moderately similar (mean={pairwise_sims.mean():.3f})")
-                print(f"      May cause some uniform posteriors when M grows large")
-            else:
-                print(f"\n  ✓ Clusters are sufficiently distinct (mean={pairwise_sims.mean():.3f})")
+        #     if pairwise_sims.mean() > 0.85:
+        #         print(f"\n  ⚠️  PROBLEM IDENTIFIED: Clusters are TOO SIMILAR (mean={pairwise_sims.mean():.3f})")
+        #         print(f"      Cause: Same scene → similar backgrounds/features")
+        #         print(f"      Effect: Uniform posteriors → always P(U|x) < tau2 → infinite growth")
+        #         print(f"      Solution: Need LOWER tau2 or HIGHER TAU2_INIT")
+        #     elif pairwise_sims.mean() > 0.70:
+        #         print(f"\n  ⚠️  WARNING: Clusters are moderately similar (mean={pairwise_sims.mean():.3f})")
+        #         print(f"      May cause some uniform posteriors when M grows large")
+        #     else:
+        #         print(f"\n  ✓ Clusters are sufficiently distinct (mean={pairwise_sims.mean():.3f})")
             
-            print(f"========================================\n")
+        #     print(f"========================================\n")
     
     def _create_cache_entry(self, feature, box, prob):
         """Add new entry to cache (Eq. 16)"""
@@ -782,3 +795,7 @@ class BCAPlusAdapter(BaseAdapter):
             image_path="",
             model_path=self.detector.model_path
         )
+
+    def reset(self):
+        """Reset for new video."""
+        self.cache = BCAPlusCache(num_classes=self.num_classes)
