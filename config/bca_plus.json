@@ -1,5 +1,5 @@
 {
-  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "data_root": "/home/fardadd/scratch/SHIFT/data",
   "split": "val",
   "filters": {
     "weather": ["clear"],
@@ -9,7 +9,7 @@
   "max_samples": null,
   "detector": {
     "name": "grounding-dino",
-    "model_path": "IDEA-Research/grounding-dino-base",
+    "model_path": "/home/fardadd/scratch/thesis-frameworks/VLM/vlm/grounding-dino-base",
     "threshold": 0.1,
     "iou_threshold": 0.7,
     "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"]

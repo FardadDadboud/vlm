@@ -355,11 +355,7 @@ class BCAPlusAdapter(BaseAdapter):
             print(f"WARNING: No pre-computed P(U|x) available, skipping cache update")
             return
         
-<<<<<<< Updated upstream
-        # # DIAGNOSTIC: Check proposals vs cache similarities
-=======
         # DIAGNOSTIC: Check proposals vs cache similarities
->>>>>>> Stashed changes
         # print(f"\n{'='*60}")
         # print(f"CACHE UPDATE - PROPOSALS VS CACHE CROSS-SIMILARITY")
         # print(f"{'='*60}")
