@@ -30,16 +30,16 @@ class VMFUtils:
     """Utilities for von Mises-Fisher distribution."""
     
     @staticmethod
-    def A_D(kappa: float, dim: int) -> float:
+    def A_D(kappa: float, dim: int, kappa_max: float = KAPPA_MAX, kappa_min: float = KAPPA_MIN) -> float:
         """
         Ratio A_D(κ) = I_{D/2}(κ) / I_{D/2-1}(κ)
         
         Uses exponentially scaled Bessel functions to avoid overflow.
         """
-        if kappa < KAPPA_MIN:
+        if kappa < kappa_min:
             return 0.0
         
-        kappa = min(kappa, KAPPA_MAX)
+        kappa = min(kappa, kappa_max)
         v = dim / 2.0
         
         # ive(v, x) = iv(v, x) * exp(-|x|) - stable for large kappa
@@ -53,14 +53,14 @@ class VMFUtils:
         return np.clip(num / denom, 0.0, 1.0)
     
     @staticmethod
-    def estimate_kappa(r_bar: float, dim: int) -> float:
+    def estimate_kappa(r_bar: float, dim: int, kappa_max: float = KAPPA_MAX, kappa_min: float = KAPPA_MIN) -> float:
         """
         Estimate κ from mean resultant length using Banerjee approximation.
         """
         r_bar = np.clip(r_bar, 1e-10, 1.0 - 1e-10)
         r_bar_sq = r_bar ** 2
         kappa = r_bar * (dim - r_bar_sq) / (1 - r_bar_sq)
-        return np.clip(kappa, KAPPA_MIN, KAPPA_MAX)
+        return np.clip(kappa, kappa_min, kappa_max)
     
     @staticmethod
     def safe_normalize(x: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -113,7 +113,9 @@ class TemporalSSM:
                  em_iterations: int = 3,
                  use_ema_kappa: bool = True,
                  kappa_ema: float = 0.9,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0,
+                 kappa_max: float = KAPPA_MAX,
+                 kappa_min: float = KAPPA_MIN):
         """
         Initialize Temporal SSM.
         
@@ -135,6 +137,8 @@ class TemporalSSM:
         self.use_ema_kappa = use_ema_kappa
         self.kappa_ema = kappa_ema
         self.temperature = temperature
+        self.kappa_max = kappa_max
+        self.kappa_min = kappa_min
         
         # Initialize state
         self.state = STADState(
@@ -303,7 +307,7 @@ class TemporalSSM:
                 # Estimate new concentration
                 total_weight = class_weights.sum() + prior_weight
                 r_bar = combined_norm / total_weight
-                new_kappa = VMFUtils.estimate_kappa(r_bar, D)
+                new_kappa = VMFUtils.estimate_kappa(r_bar, D, self.kappa_max, self.kappa_min)
                 
                 # EMA smoothing (optional)
                 if self.use_ema_kappa:
@@ -314,7 +318,7 @@ class TemporalSSM:
             
             # Update state
             self.state.rho = VMFUtils.safe_normalize(new_rho)
-            self.state.gamma = np.clip(new_gamma, KAPPA_MIN, KAPPA_MAX)
+            self.state.gamma = np.clip(new_gamma, self.kappa_min, self.kappa_max)
             
             if self.use_ema_kappa:
                 self.state.gamma_ema = self.state.gamma.copy()
@@ -342,7 +346,7 @@ if __name__ == "__main__":
     # Test VMFUtils stability
     print("\n1. Testing A_D stability:")
     for kappa in [1, 10, 100, 500, 1000, 2000]:
-        a_d = VMFUtils.A_D(kappa, 262)
+        a_d = VMFUtils.A_D(kappa, 262, KAPPA_MAX, KAPPA_MIN)
         print(f"   κ={kappa:>4}: A_D = {a_d:.6f}")
     
     # Test SSM

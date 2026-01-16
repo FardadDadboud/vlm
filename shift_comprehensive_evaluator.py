@@ -221,7 +221,7 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
             break
         
         video_time = time.time() - video_start
-        if (video_idx + 1) % 5 == 0:
+        if (video_idx + 1) % 1 == 0:
             elapsed = time.time() - start_time
             print(f"  Videos: {video_idx+1}/{len(video_samples)} | "
                   f"Frames: {total_processed} | "

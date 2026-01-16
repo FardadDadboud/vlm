@@ -6,7 +6,7 @@
     "output_dir": "./shift_temporal_tta_results",
     
     "filters": {
-        "weather": ["clear", "rainy", "overcast", "foggy", "cloudy"],
+        "weather": ["clear"],
         "time": ["daytime"],
         "max_frames_per_video": null
     },
@@ -28,14 +28,15 @@
       "kappa_ems": 10.0,
       "window_size": 5,
       "em_iterations": 3,
-      "tau_update": 0.7,
+      "tau_update": 0.6,
       "fusion_mode": "entropy",
       "alpha": 0.0,
       "temperature": 15.0,
       "use_ema_kappa": true,
       "kappa_ema": 0.9,
       "update_after_nms": true,
-      "debug_mode": true
+      "kappa_max": 30.0,
+      "kappa_min": 1e-6
     }
   },
   "reset_on_video_change": true,

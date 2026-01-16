@@ -366,7 +366,7 @@ class VLMSHIFTDomainEvaluator:
         best_f1 = 0
         best_threshold = 0
         
-        for thresh in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7]:
+        for thresh in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
             tp = (tp_scores >= thresh).sum()
             fp = (fp_scores >= thresh).sum()
             fn = (tp_scores < thresh).sum()
@@ -420,7 +420,7 @@ class VLMSHIFTDomainEvaluator:
             })
         
         # NMS IoU thresholds to test
-        nms_thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        nms_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
         
         results = []
         
