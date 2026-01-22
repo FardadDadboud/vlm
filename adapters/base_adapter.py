@@ -29,3 +29,11 @@ class BaseAdapter(ABC):
             DetectionResult object
         """
         raise NotImplementedError
+
+    def reset(self):
+        """Reset adapter state for new video/sequence."""
+        pass
+    
+    def get_stats(self):
+        """Get adapter statistics for debugging."""
+        return {}

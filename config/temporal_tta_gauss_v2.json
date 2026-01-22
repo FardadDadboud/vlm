@@ -1,0 +1,62 @@
+{
+  "description": "Temporal TTA v2 configuration using STAD-Gaussian (Kalman filter) for SHIFT dataset evaluation",
+  
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "output_dir": "./shift_temporal_tta_gaussian_results",
+  
+  "filters": {
+      "weather": ["clear"],
+      "time": ["daytime"],
+      "max_frames_per_video": null
+  },
+  "max_samples": null,    
+  "num_visualizations": 1000,
+  
+  "detector": {
+      "name": "grounding-dino",
+      "model_path": "IDEA-Research/grounding-dino-base",
+      "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
+      "threshold": 0.10,
+      "iou_threshold": 0.7
+  },
+  
+  "adaptation": {
+      "type": "temporal_v2",
+      "params": {
+          "_comment": "STAD-Gaussian (Kalman filter) configuration",
+          "ssm_type": "gaussian",
+          
+          "_comment_kalman": "Kalman filter noise parameters",
+          "q_scale": 0.01,
+          "r_base": 0.5,
+          
+          "_comment_smoothing": "RTS smoothing (optional, adds computation)",
+          "use_smoothing": false,
+          "window_size": 5,
+          
+          "_comment_update": "Update control",
+          "tau_update": 0.6,
+          "min_updates_per_class": 2,
+          "update_after_nms": true,
+          
+          "_comment_fusion": "Prediction fusion settings",
+          "fusion_mode": "entropy",
+          "fusion_weight": 0.5,
+          "alpha": 0.0,
+          "temperature": 1.0,
+          
+          "_comment_pi": "Mixing coefficients settings",
+          "use_ema_pi": true,
+          "pi_ema_decay": 0.9,
+          "dirichlet_alpha": 0.01,
+          
+          "_comment_debug": "Debug mode and debug every n frames",
+          "debug": true,
+          "debug_every": 30
+      }
+  },
+  
+  "reset_on_video_change": true,
+  "process_by_video": true
+}

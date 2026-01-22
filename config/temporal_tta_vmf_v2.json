@@ -1,0 +1,76 @@
+{
+  "description": "Temporal TTA v2 configuration using STAD-vMF (von Mises-Fisher) for SHIFT dataset evaluation",
+  
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "output_dir": "./shift_temporal_tta_vmf_results",
+  
+  "filters": {
+      "weather": ["clear"],
+      "time": ["daytime"],
+      "max_frames_per_video": null
+  },
+  "max_samples": null,    
+  "num_visualizations": 1000,
+  
+  "detector": {
+      "name": "grounding-dino",
+      "model_path": "IDEA-Research/grounding-dino-base",
+      "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
+      "threshold": 0.10,
+      "iou_threshold": 0.7
+  },
+  
+  "adaptation": {
+      "type": "temporal_v2",
+      "params": {
+          "_comment": "STAD-vMF configuration",
+          "ssm_type": "vmf",
+          
+          "_comment_kappa": "Global concentration parameters (paper M-step)",
+          "kappa_trans": 10.0,
+          "kappa_ems": 20.0,
+          
+          "_comment_gamma": "Per-class variational concentration",
+          "gamma_init": 10.0,
+          
+          "_comment_bounds": "Configurable bounds for kappa and gamma",
+          "kappa_max": 100.0,
+          "kappa_min": 1e-6,
+          "gamma_max": 200.0,
+          "gamma_min": 1.0,
+          
+          "_comment_em": "EM algorithm settings",
+          "window_size": 10,
+          "em_iterations": 3,
+          
+          "_comment_update": "Update control",
+          "tau_update": 0.5,
+          "min_updates_per_class": 10,
+          "update_after_nms": true,
+          "update_global_kappa": false,
+          
+          "_comment_fusion": "Prediction fusion settings",
+          "fusion_mode": "entropy",
+          "fusion_weight": 0.5,
+          "alpha": 0.5,
+          "temperature": 1.0,
+          
+          "_comment_pi": "Mixing coefficients settings",
+          "use_pi": false,
+          "use_ema_pi": false,
+          "pi_ema_decay": 1.0,
+          "dirichlet_alpha": 5.0,
+          
+          "_comment_vlm": "VLM prior weight for E-step (0=SSM only, 1=VLM only)",
+          "vlm_prior_weight": 0.2,
+          
+          "_comment_debug": "Debug mode and debug every n frames",
+          "debug": false,
+          "debug_every": 30
+      }
+  },
+  
+  "reset_on_video_change": true,
+  "process_by_video": true
+}

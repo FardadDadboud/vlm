@@ -10,6 +10,26 @@ Available adapters:
 from .base_adapter import BaseAdapter
 from .vanilla_adapter import VanillaAdapter
 from .bca_plus_adapter import BCAPlusAdapter
+from .base_adapter import BaseAdapter
+from .global_cache import GlobalCache, ClassStatistics
+from .instance_cache import InstanceCache, Track
+from .trackers import (
+    KalmanBoxTracker,
+    KalmanState,
+    HungarianAssociator,
+    ByteTrackAssociator,
+    JPDAAssociator,
+    DeepSORTAssociator,
+    create_associator,
+    AssociationResult
+)
+from .global_instance_adapter import (
+    GlobalInstanceAdapter,
+    GlobalOnlyAdapter,
+    InstanceOnlyAdapter,
+    TrackingOnlyAdapter,
+    create_global_instance_adapter
+)
 
 # Try to import temporal adapter (may need additional dependencies)
 try:
@@ -18,6 +38,8 @@ try:
 except ImportError as e:
     print(f"Warning: Temporal adapter not available: {e}")
     TEMPORAL_AVAILABLE = False
+
+from .temporal_adapter_v2 import TemporalTTAAdapterV2
 
 
 def create_adapter(adaptation_type: str, detector, config: dict) -> BaseAdapter:
@@ -47,10 +69,15 @@ def create_adapter(adaptation_type: str, detector, config: dict) -> BaseAdapter:
         if not TEMPORAL_AVAILABLE:
             raise ImportError("Temporal adapter not available. Check dependencies.")
         return TemporalTTAAdapter(detector, config)
-    
+
+    elif adaptation_type == 'temporal_v2':
+        return TemporalTTAAdapterV2(detector, config)
+
+    elif adaptation_type == 'global_instance':
+        return GlobalInstanceAdapter(detector, config)
     else:
         raise ValueError(f"Unknown adaptation type: {adaptation_type}. "
-                        f"Available: none, vanilla, bca_plus, temporal")
+                        f"Available: none, vanilla, bca_plus, temporal, global_instance")
 
 
 def list_adapters() -> dict:
@@ -59,7 +86,8 @@ def list_adapters() -> dict:
         'none': {'available': True, 'description': 'No adaptation (alias for vanilla)'},
         'vanilla': {'available': True, 'description': 'No adaptation, passthrough'},
         'bca_plus': {'available': True, 'description': 'BCA+ Bayesian Class Adaptation'},
-        'temporal': {'available': TEMPORAL_AVAILABLE, 'description': 'STAD temporal adaptation'}
+        'temporal': {'available': TEMPORAL_AVAILABLE, 'description': 'STAD temporal adaptation'},
+        'global_instance': {'available': True, 'description': 'Global + Instance Temporal BCA+'}
     }
     return adapters
 
@@ -74,3 +102,32 @@ __all__ = [
 
 if TEMPORAL_AVAILABLE:
     __all__.append('TemporalTTAAdapter')
+
+__all__.extend([
+    # Global cache
+    'GlobalCache',
+    'ClassStatistics',
+    
+    # Instance cache
+    'InstanceCache',
+    'Track',
+    
+    # Trackers
+    'KalmanBoxTracker',
+    'KalmanState',
+    'HungarianAssociator',
+    'ByteTrackAssociator',
+    'JPDAAssociator',
+    'DeepSORTAssociator',
+    'create_associator',
+    'AssociationResult',
+    
+    # Main adapters
+    'GlobalInstanceAdapter',
+    'GlobalOnlyAdapter',
+    'InstanceOnlyAdapter',
+    'TrackingOnlyAdapter',
+    'create_global_instance_adapter'
+])
+
+__all__.append('TemporalTTAAdapterV2')

@@ -1,0 +1,91 @@
+{
+    "description": "Global + Instance Temporal BCA+ configuration for SHIFT dataset",
+    
+    "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+    "split": "val",
+    "output_dir": "./shift_global_instance_results",
+    
+    "filters": {
+        "weather": ["clear"],
+        "time": ["daytime"],
+        "max_frames_per_video": null
+    },
+    "max_samples": null,
+    "num_visualizations": 1000,
+    
+    "detector": {
+        "name": "grounding-dino",
+        "model_path": "IDEA-Research/grounding-dino-base",
+        "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
+        "threshold": 0.10,
+        "iou_threshold": 0.7
+    },
+    
+    "adaptation": {
+        "type": "global_instance",
+        "params": {
+            "global": {
+                "enabled": true,
+                "prototype_momentum": 0.9,
+                "scale_momentum": 0.95,
+                "use_instance_clusters": true,
+                "max_clusters_per_class": 10,
+                "tau_global": 0.6,
+                "_comment": "Global cache for class-level adaptation"
+            },
+            "instance": {
+                "enabled": true,
+                "max_tracks": 100,
+                "min_hits_to_confirm": 3,
+                "max_age": 10,
+                "feature_smoothing": 0.7,
+                "class_prob_smoothing": 0.8,
+                "_comment": "Instance cache for per-object tracking"
+            },
+            "tracker": {
+                "method": "bytetrack",
+                "iou_threshold": 0.7,
+                "feature_weight": 0.3,
+                "high_threshold": 0.8,
+                "low_threshold": 0.5,
+                "_comment": "Data association method: hungarian, bytetrack, jpda, deepsort"
+            },
+            "fusion": {
+                "mode": "entropy",
+                "vlm_weight": 0.4,
+                "global_weight": 0.3,
+                "instance_weight": 0.3,
+                "temperature": 1.0,
+                "_comment": "Fusion mode: entropy, weighted, vlm_only, global_only, instance_only"
+            },
+            "tau_update": 0.6,
+            "update_after_nms": true,
+            "alpha": 0.7,
+            "debug": false
+        }
+    },
+    
+    "reset_on_video_change": true,
+    "process_by_video": true,
+    
+    "_ablation_variants": {
+        "_comment": "Use these configs for ablation study",
+        "global_only": {
+            "global": {"enabled": true},
+            "instance": {"enabled": false},
+            "fusion": {"mode": "global_only"}
+        },
+        "instance_only": {
+            "global": {"enabled": false},
+            "instance": {"enabled": true},
+            "fusion": {"mode": "instance_only"}
+        },
+        "vlm_only": {
+            "global": {"enabled": false},
+            "instance": {"enabled": false},
+            "fusion": {"mode": "vlm_only"}
+        },
+        "tracker_methods": ["hungarian", "bytetrack", "jpda", "deepsort"],
+        "fusion_modes": ["entropy", "weighted", "vlm_only", "global_only", "instance_only"]
+    }
+}
