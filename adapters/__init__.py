@@ -11,24 +11,49 @@ from .base_adapter import BaseAdapter
 from .vanilla_adapter import VanillaAdapter
 from .bca_plus_adapter import BCAPlusAdapter
 from .base_adapter import BaseAdapter
-from .global_cache import GlobalCache, ClassStatistics
-from .instance_cache import InstanceCache, Track
-from .trackers import (
+# Import from track.py (single file with all tracking components)
+from .track import (
+    # Kalman filter
     KalmanBoxTracker,
-    KalmanState,
-    HungarianAssociator,
-    ByteTrackAssociator,
-    JPDAAssociator,
-    DeepSORTAssociator,
-    create_associator,
-    AssociationResult
+    KalmanFilterConfig,
+    create_kalman_tracker,
+    
+    # Data association
+    AssociationConfig,
+    associate,
+    associate_iou,
+    associate_combined,
+    associate_bytetrack,
+    compute_iou,
+    compute_iou_matrix,
+    
+    # Per-track STAD (FULL implementations)
+    TrackSTADConfig,
+    TrackSTADvMF,
+    TrackSTADGaussian,
+    create_track_stad,
+    
+    # Track management
+    Track,
+    TrackState,
+    TrackConfig,
+    TrackManager,
+    Detection,
+    reset_track_ids
 )
+
+# Import enhanced BCA+ cache
+from .enhanced_bca_cache import (
+    EnhancedBCAPlusCache,
+    EnhancedBCAPlusConfig,
+    CacheEntryState
+)
+
+# Import main adapter
 from .global_instance_adapter import (
     GlobalInstanceAdapter,
-    GlobalOnlyAdapter,
-    InstanceOnlyAdapter,
-    TrackingOnlyAdapter,
-    create_global_instance_adapter
+    GlobalInstanceConfig,
+    get_ablation_config
 )
 
 # Try to import temporal adapter (may need additional dependencies)
@@ -104,30 +129,43 @@ if TEMPORAL_AVAILABLE:
     __all__.append('TemporalTTAAdapter')
 
 __all__.extend([
-    # Global cache
-    'GlobalCache',
-    'ClassStatistics',
-    
-    # Instance cache
-    'InstanceCache',
-    'Track',
-    
-    # Trackers
-    'KalmanBoxTracker',
-    'KalmanState',
-    'HungarianAssociator',
-    'ByteTrackAssociator',
-    'JPDAAssociator',
-    'DeepSORTAssociator',
-    'create_associator',
-    'AssociationResult',
-    
-    # Main adapters
+    # Main adapter
     'GlobalInstanceAdapter',
-    'GlobalOnlyAdapter',
-    'InstanceOnlyAdapter',
-    'TrackingOnlyAdapter',
-    'create_global_instance_adapter'
+    'GlobalInstanceConfig',
+    'get_ablation_config',
+    
+    # Global cache
+    'EnhancedBCAPlusCache',
+    'EnhancedBCAPlusConfig',
+    'CacheEntryState',
+    
+    # Kalman filter
+    'KalmanBoxTracker',
+    'KalmanFilterConfig',
+    'create_kalman_tracker',
+    
+    # Data association
+    'AssociationConfig',
+    'associate',
+    'associate_iou',
+    'associate_combined',
+    'associate_bytetrack',
+    'compute_iou',
+    'compute_iou_matrix',
+    
+    # Per-track STAD
+    'TrackSTADConfig',
+    'TrackSTADvMF',
+    'TrackSTADGaussian',
+    'create_track_stad',
+    
+    # Track management
+    'Track',
+    'TrackState',
+    'TrackConfig',
+    'TrackManager',
+    'Detection',
+    'reset_track_ids'
 ])
 
 __all__.append('TemporalTTAAdapterV2')

@@ -1,5 +1,5 @@
 {
-    "description": "Global + Instance Temporal BCA+ configuration for SHIFT dataset",
+    "description": "Global+Instance TTA configuration combining BCA+ global cache with per-track STAD for SHIFT dataset evaluation",
     
     "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
     "split": "val",
@@ -10,7 +10,7 @@
         "time": ["daytime"],
         "max_frames_per_video": null
     },
-    "max_samples": null,
+    "max_samples": null,    
     "num_visualizations": 1000,
     
     "detector": {
@@ -24,68 +24,101 @@
     "adaptation": {
         "type": "global_instance",
         "params": {
-            "global": {
-                "enabled": true,
-                "prototype_momentum": 0.9,
-                "scale_momentum": 0.95,
-                "use_instance_clusters": true,
-                "max_clusters_per_class": 10,
-                "tau_global": 0.6,
-                "_comment": "Global cache for class-level adaptation"
-            },
-            "instance": {
-                "enabled": true,
-                "max_tracks": 100,
-                "min_hits_to_confirm": 3,
-                "max_age": 10,
-                "feature_smoothing": 0.7,
-                "class_prob_smoothing": 0.8,
-                "_comment": "Instance cache for per-object tracking"
-            },
-            "tracker": {
-                "method": "bytetrack",
-                "iou_threshold": 0.7,
-                "feature_weight": 0.3,
-                "high_threshold": 0.8,
-                "low_threshold": 0.5,
-                "_comment": "Data association method: hungarian, bytetrack, jpda, deepsort"
-            },
-            "fusion": {
-                "mode": "entropy",
-                "vlm_weight": 0.4,
-                "global_weight": 0.3,
-                "instance_weight": 0.3,
-                "temperature": 1.0,
-                "_comment": "Fusion mode: entropy, weighted, vlm_only, global_only, instance_only"
-            },
-            "tau_update": 0.6,
-            "update_after_nms": true,
-            "alpha": 0.7,
-            "debug": false
+            "_comment": "=== Ablation Mode ===",
+            "mode": "full",
+            "_mode_options": "vanilla | global_only | instance_only | full | cascade",
+            
+            "_comment_global": "=== Global BCA+ Cache Configuration ===",
+            "use_global_cache": true,
+            "tau1": 0.6,
+            "tau2": 0.9,
+            "tau2_tentative": 0.85,
+            "tau2_init": 0.8,
+            "max_cache_size": 25,
+            "ws": 0.1,
+            "alpha": 0.3,
+            "logit_temperature": 10.0,
+            "use_batch_init": true,
+            "batch_init_size": 10,
+            
+            "_comment_tracking": "=== Tracking Configuration ===",
+            "use_tracking": true,
+            "min_hits_to_confirm": 3,
+            "max_age": 30,
+            "feature_alpha": 0.1,
+            "association_method": "hungarian",
+            "_association_options": "iou | hungarian | combined | bytetrack",
+            "iou_threshold": 0.3,
+            "feature_threshold": 0.5,
+            "high_score_threshold": 0.6,
+            "low_score_threshold": 0.1,
+            
+            "_comment_stad": "=== Per-Track STAD Configuration ===",
+            "use_track_stad": true,
+            "ssm_type": "vmf",
+            "_ssm_type_options": "vmf | gaussian",
+            
+            "_comment_vmf": "=== STAD-vMF Parameters (matching temporal_ssm_v2.py) ===",
+            "kappa_trans": 10.0,
+            "kappa_ems": 20.0,
+            "gamma_init": 10.0,
+            "kappa_max": 100.0,
+            "kappa_min": 1e-6,
+            "gamma_max": 200.0,
+            "gamma_min": 1.0,
+            "gamma_ema_decay": 0.7,
+            
+            "_comment_em": "=== Windowed EM Parameters ===",
+            "window_size": 5,
+            "em_iterations": 3,
+            "min_updates_per_class": 0.5,
+            "max_rk_fraction": 0.5,
+            
+            "_comment_fusion": "=== Fusion Parameters ===",
+            "temperature": 1.0,
+            "vlm_prior_weight": 0.2,
+            
+            "_comment_pi": "=== Mixing Coefficients (π) ===",
+            "use_pi": true,
+            "use_ema_pi": false,
+            "pi_ema_decay": 1.0,
+            "dirichlet_alpha": 0.1,
+            
+            "_comment_gaussian": "=== STAD-Gaussian Parameters (if ssm_type=gaussian) ===",
+            "q_scale": 0.01,
+            "r_base": 0.5,
+            "use_diagonal_cov": true,
+            "use_smoothing": false,
+            
+            "_comment_update": "=== Update Control ===",
+            "tau_update": 0.5,
+            "detection_threshold": 0.10,
+            "nms_threshold": 0.7,
+            
+            "_comment_part53": "=== Part 5.3: Track Init from Global Cache ===",
+            "init_from_cache": true,
+            "cache_match_threshold": 0.5,
+            
+            "_comment_feedback": "=== Track-to-Cache Feedback ===",
+            "use_track_to_cache_feedback": true,
+            "feedback_min_hits": 5,
+            "feedback_min_confidence": 0.8,
+            "feedback_weight": 0.5,
+            
+            "_comment_fusion": "=== Part 5.2: 3-Source Fusion ===",
+            "fusion_mode": "entropy_weighted",
+            "_fusion_mode_options": "entropy_weighted | hierarchical | parallel | selection",
+            "fusion_init_weight": 0.1,
+            "fusion_global_weight": 0.3,
+            "fusion_track_weight": 0.6,
+            "fusion_confidence_threshold": 0.7,
+            
+            "_comment_debug": "=== Debug ===",
+            "debug": false,
+            "debug_every": 30
         }
     },
     
     "reset_on_video_change": true,
-    "process_by_video": true,
-    
-    "_ablation_variants": {
-        "_comment": "Use these configs for ablation study",
-        "global_only": {
-            "global": {"enabled": true},
-            "instance": {"enabled": false},
-            "fusion": {"mode": "global_only"}
-        },
-        "instance_only": {
-            "global": {"enabled": false},
-            "instance": {"enabled": true},
-            "fusion": {"mode": "instance_only"}
-        },
-        "vlm_only": {
-            "global": {"enabled": false},
-            "instance": {"enabled": false},
-            "fusion": {"mode": "vlm_only"}
-        },
-        "tracker_methods": ["hungarian", "bytetrack", "jpda", "deepsort"],
-        "fusion_modes": ["entropy", "weighted", "vlm_only", "global_only", "instance_only"]
-    }
-}
+    "process_by_video": true
+  }
