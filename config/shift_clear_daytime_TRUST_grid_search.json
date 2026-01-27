@@ -1,0 +1,27 @@
+{
+  "base_config_path": "config/global_instance.json",
+  "grid_params": {
+    "adaptation.params.tau1": [0.6, 0.5],
+    "adaptation.params.tau2": [0.9, 0.8],
+    "adaptation.params.ws": [0.1, 0.3],
+    "adaptation.params.logit_temperature": [5.0, 10.0],
+    "adaptation.params.alpha": [0.0, 0.3],
+    "adaptation.params.tau2_init": [0.9, 0.8],
+    "adaptation.params.max_cache_size": [25, 50],
+    "adaptation.params.track_creation_threshold": [0.9, 0.8]
+  },
+  "execution": {
+    "gpu_memory_per_job_gb": 4.0,
+    "safety_margin_gb": 1.0,
+    "checkpoint_frequency": 10
+  },
+  "dataset_subset": {
+    "filters": {
+      "weather": ["clear"],
+      "time": ["daytime"],
+      "max_frames_per_video": null
+    },
+    "max_samples": null
+  },
+  "output_dir": "./shift_clear_daytime_TRUST_grid_search_results"
+}

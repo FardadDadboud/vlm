@@ -199,7 +199,6 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
         for frame_idx, (dataset_idx, sample) in enumerate(samples):
             if max_samples is not None and total_processed >= max_samples:
                 break
-                
             image_path = sample['image_path']
             image = Image.open(image_path)
             

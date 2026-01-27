@@ -145,6 +145,13 @@ class EnhancedBCAPlusCache:
         self.frame_count: int = 0
         self.total_entries_created: int = 0
         self.total_entries_deleted: int = 0
+        
+        # Debug counters
+        self._debug_updates_attempted: int = 0
+        self._debug_updates_low_conf: int = 0
+        self._debug_updates_batch_buffered: int = 0
+        self._debug_entries_matched: int = 0
+        self._debug_entries_created: int = 0
     
     def is_empty(self) -> bool:
         """Check if cache is empty."""
@@ -191,9 +198,8 @@ class EnhancedBCAPlusCache:
         # Normalize feature
         feature_norm = self._normalize(feature.reshape(-1, 1), axis=0).flatten()
         
-        # Feature similarity: S_F[m] = <h, F[:,m]>
-        F_norm = self._normalize(self.F_cache, axis=0)  # (D, M)
-        S_F = feature_norm @ F_norm  # (M,)
+        # Feature similarity: S_F[m] = <h, F[:,m]> (F_cache already normalized)
+        S_F = feature_norm @ self.F_cache  # (M,)
         
         # Scale similarity: S_B[m] = 1 - |scale - B[m]| / max(scale, B[m])
         scale = (box[2] - box[0]) * (box[3] - box[1])  # Area
@@ -206,6 +212,41 @@ class EnhancedBCAPlusCache:
         # Posterior via softmax
         logits = self.config.logit_temperature * S
         posterior = self._safe_softmax(logits)
+        
+        return posterior
+    
+    def compute_posterior_batch(self, features: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+        """
+        Batch compute posterior over cache entries for multiple detections.
+        
+        Args:
+            features: (N, D) detection features
+            boxes: (N, 4) detection boxes
+            
+        Returns:
+            (N, M) posterior probabilities
+        """
+        N = len(features)
+        if self.M == 0 or N == 0:
+            return np.zeros((N, 0))
+        
+        # Normalize features: (N, D)
+        features_norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-10)
+        
+        # Feature similarity: (N, M) - F_cache already normalized
+        S_F = features_norm @ self.F_cache  # (N, D) @ (D, M) -> (N, M)
+        
+        # Scale similarity: (N, M)
+        scales = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])  # (N,)
+        scale_diff = np.abs(scales[:, np.newaxis] - self.B_cache[np.newaxis, :])  # (N, M)
+        S_B = 1 - scale_diff / (np.maximum(scales[:, np.newaxis], self.B_cache[np.newaxis, :]) + 1e-10)
+        
+        # Combined similarity
+        S = (1 - self.config.ws) * S_F + self.config.ws * S_B  # (N, M)
+        
+        # Posterior via softmax (row-wise)
+        logits = self.config.logit_temperature * S
+        posterior = self._safe_softmax(logits, axis=1)  # (N, M)
         
         return posterior
     
@@ -250,6 +291,43 @@ class EnhancedBCAPlusCache:
         
         return adapted / (adapted.sum() + eps)
     
+    def adapt_probs_batch(self, features: np.ndarray, boxes: np.ndarray,
+                         class_probs: np.ndarray) -> np.ndarray:
+        """
+        Batch adapt class probabilities for multiple detections.
+        
+        Args:
+            features: (N, D) detection features
+            boxes: (N, 4) detection boxes
+            class_probs: (N, K) VLM class probabilities
+            
+        Returns:
+            (N, K) adapted class probabilities
+        """
+        N = len(features)
+        if self.M == 0 or N == 0:
+            return class_probs.copy()
+        
+        # Batch posterior: (N, M)
+        posterior = self.compute_posterior_batch(features, boxes)
+        
+        # Cache prediction: P(y|cache) = posterior @ V_cache.T -> (N, K)
+        cache_probs = posterior @ self.V_cache.T  # (N, M) @ (M, K) -> (N, K)
+        cache_probs = cache_probs / (cache_probs.sum(axis=1, keepdims=True) + 1e-10)
+        
+        # Entropy-weighted fusion (vectorized)
+        eps = 1e-10
+        H_vlm = -np.sum(class_probs * np.log(class_probs + eps), axis=1)    # (N,)
+        H_cache = -np.sum(cache_probs * np.log(cache_probs + eps), axis=1)  # (N,)
+        
+        w_vlm = np.exp(-H_vlm)[:, np.newaxis]     # (N, 1)
+        w_cache = np.exp(-H_cache)[:, np.newaxis]  # (N, 1)
+        
+        adapted = (w_vlm * class_probs + w_cache * cache_probs) / (w_vlm + w_cache + eps)
+        adapted = adapted / (adapted.sum(axis=1, keepdims=True) + eps)
+        
+        return adapted
+    
     def update_cache(self, features: np.ndarray, boxes: np.ndarray,
                     probs: np.ndarray, scores: np.ndarray) -> None:
         """
@@ -265,13 +343,18 @@ class EnhancedBCAPlusCache:
         if N == 0:
             return
         
+        self._debug_updates_attempted += N
+        
         # Handle batch initialization
         if self.config.use_batch_init and not self.batch_init_done:
+            self._debug_updates_batch_buffered += N
             self._collect_for_batch_init(features, boxes, probs, scores)
             return
         
         # Filter by confidence threshold
         high_conf_mask = scores >= self.config.tau1
+        n_low_conf = int(np.sum(~high_conf_mask))
+        self._debug_updates_low_conf += n_low_conf
         
         if not high_conf_mask.any():
             return
@@ -292,6 +375,7 @@ class EnhancedBCAPlusCache:
         if self.M == 0:
             # Create first entry
             self._create_entry(feature, box, prob, score)
+            self._debug_entries_created += 1
             return
         
         # Compute posterior
@@ -302,10 +386,12 @@ class EnhancedBCAPlusCache:
         if posterior[m_star] >= tau2:
             # Match found - update existing entry
             self._update_entry(m_star, feature, box, prob, score)
+            self._debug_entries_matched += 1
         else:
             # No good match - create new entry
             if self.M < self.config.max_cache_size:
                 self._create_entry(feature, box, prob, score)
+                self._debug_entries_created += 1
     
     def _create_entry(self, feature: np.ndarray, box: np.ndarray,
                      prob: np.ndarray, score: float) -> int:
@@ -386,7 +472,19 @@ class EnhancedBCAPlusCache:
             self._batch_init_cache()
     
     def _batch_init_cache(self) -> None:
-        """Initialize cache with diverse entries using greedy clustering."""
+        """
+        Initialize cache with clustering (matching original BCA+ behavior).
+        
+        Strategy (from original BCA+):
+        1. Group proposals by predicted class
+        2. Within each class, cluster based on feature+scale similarity
+        3. Create ONE cache entry per cluster (not per detection!)
+        
+        This avoids creating near-duplicate entries from similar detections.
+        
+        CRITICAL: Use HIGHER threshold for clustering than tau2 to avoid
+        over-aggressive merging that creates generic centroids.
+        """
         features = np.array(self.init_buffer_features)  # (N, D)
         scales = np.array(self.init_buffer_scales)       # (N,)
         probs = np.array(self.init_buffer_probs)         # (N, K)
@@ -397,64 +495,109 @@ class EnhancedBCAPlusCache:
             self.batch_init_done = True
             return
         
+        # CRITICAL: Use stricter threshold for batch-init clustering
+        TAU2_INIT = self.config.tau2_init  # Higher than tau2 (typically 0.8)
+        MAX_CLUSTER_SIZE = 50  # Limit cluster size to prevent over-averaging
+        
         # Normalize features
         features_norm = self._normalize(features.T, axis=0).T  # (N, D)
         
-        # Greedy selection by class diversity
-        selected_indices = []
-        used_classes = set()
+        # Get predicted class for each proposal
+        predicted_classes = np.argmax(probs, axis=1)
         
-        # First pass: one high-conf detection per class
-        class_indices = np.argmax(probs, axis=1)  # (N,)
+        all_clusters = []
         
-        for c in range(self.num_classes):
-            class_mask = class_indices == c
-            if not class_mask.any():
+        # Process each class separately
+        for class_idx in range(self.num_classes):
+            # Get proposals for this class
+            class_mask = predicted_classes == class_idx
+            if not np.any(class_mask):
                 continue
             
-            class_scores = scores.copy()
-            class_scores[~class_mask] = -1
+            class_indices = np.where(class_mask)[0]
+            class_features = features_norm[class_mask]
+            class_scales = scales[class_mask]
+            class_probs = probs[class_mask]
+            class_scores = scores[class_mask]
             
-            best_idx = np.argmax(class_scores)
-            if class_scores[best_idx] >= self.config.tau1:
-                selected_indices.append(best_idx)
-                used_classes.add(c)
-        
-        # Second pass: fill remaining slots with diverse entries
-        remaining_budget = min(self.config.max_cache_size - len(selected_indices), N - len(selected_indices))
-        
-        for _ in range(remaining_budget):
-            if len(selected_indices) >= N:
-                break
+            # Sort by confidence (descending) for greedy clustering
+            sorted_order = np.argsort(class_scores)[::-1]
             
-            # Find entry most different from selected
-            best_idx = -1
-            best_min_sim = float('inf')
+            # Greedy clustering within this class
+            clusters = []  # Each cluster: {'indices': [], 'centroid_feature', 'centroid_scale', 'total_prob'}
             
-            for i in range(N):
-                if i in selected_indices:
-                    continue
+            for local_idx in sorted_order:
+                feature = class_features[local_idx]
+                scale = class_scales[local_idx]
+                prob = class_probs[local_idx]
                 
-                # Compute min similarity to selected
-                min_sim = float('inf')
-                for j in selected_indices:
-                    sim = np.dot(features_norm[i], features_norm[j])
-                    min_sim = min(min_sim, sim)
+                # Find best matching cluster
+                best_cluster_idx = -1
+                best_sim = -1.0
                 
-                # Lower min_sim = more diverse
-                if min_sim < best_min_sim:
-                    best_min_sim = min_sim
-                    best_idx = i
+                for cluster_idx, cluster in enumerate(clusters):
+                    # Feature similarity
+                    feat_sim = float(np.dot(feature, cluster['centroid_feature']))
+                    
+                    # Scale similarity
+                    scale_diff = abs(scale - cluster['centroid_scale'])
+                    max_scale = max(scale, cluster['centroid_scale']) + 1e-10
+                    scale_sim = 1 - scale_diff / max_scale
+                    
+                    # Combined similarity
+                    combined_sim = (1 - self.config.ws) * feat_sim + self.config.ws * scale_sim
+                    
+                    if combined_sim > best_sim:
+                        best_sim = combined_sim
+                        best_cluster_idx = cluster_idx
+                
+                # Decide: add to existing cluster or create new one
+                can_add_to_cluster = (best_sim >= TAU2_INIT and 
+                                     best_cluster_idx >= 0 and 
+                                     len(clusters[best_cluster_idx]['indices']) < MAX_CLUSTER_SIZE)
+                
+                if can_add_to_cluster:
+                    # Add to existing cluster
+                    cluster = clusters[best_cluster_idx]
+                    cluster['indices'].append(local_idx)
+                    
+                    # Update centroid (running mean)
+                    n = len(cluster['indices'])
+                    cluster['centroid_feature'] = ((n-1) * cluster['centroid_feature'] + feature) / n
+                    cluster['centroid_feature'] /= (np.linalg.norm(cluster['centroid_feature']) + 1e-8)
+                    cluster['centroid_scale'] = ((n-1) * cluster['centroid_scale'] + scale) / n
+                    cluster['total_prob'] = cluster['total_prob'] + prob
+                else:
+                    # Create new cluster
+                    clusters.append({
+                        'indices': [local_idx],
+                        'centroid_feature': feature.copy(),
+                        'centroid_scale': scale,
+                        'total_prob': prob.copy()
+                    })
             
-            if best_idx >= 0 and best_min_sim < self.config.tau2_init:
-                selected_indices.append(best_idx)
+            all_clusters.extend(clusters)
         
-        # Create entries for selected detections
-        for idx in selected_indices:
-            box = np.array([0, 0, np.sqrt(scales[idx]), np.sqrt(scales[idx])])  # Dummy box with correct area
-            self._create_entry(features[idx], box, probs[idx], scores[idx])
-            # Use the stored scale directly
-            self.B_cache[-1] = scales[idx]
+        # Create cache entries from clusters
+        for cluster in all_clusters:
+            n = len(cluster['indices'])
+            mean_prob = cluster['total_prob'] / n
+            
+            # Denormalize feature for _create_entry
+            feature = cluster['centroid_feature']
+            
+            # Create dummy box with correct area
+            side = np.sqrt(cluster['centroid_scale'])
+            box = np.array([0, 0, side, side])
+            
+            # Create entry
+            self._create_entry(feature, box, mean_prob, float(np.max(mean_prob)))
+            
+            # Override scale with actual centroid scale
+            self.B_cache[-1] = cluster['centroid_scale']
+            
+            # Set count to cluster size (for confidence)
+            self.C_cache[-1] = n
         
         # Clear buffer
         self.init_buffer_features = []
@@ -462,6 +605,8 @@ class EnhancedBCAPlusCache:
         self.init_buffer_probs = []
         self.init_buffer_scores = []
         self.batch_init_done = True
+        
+        self._debug_entries_created += len(all_clusters)
     
     def age_entries(self) -> None:
         """Age all entries (call once per frame)."""
@@ -552,7 +697,14 @@ class EnhancedBCAPlusCache:
             'frame_count': self.frame_count,
             'total_created': self.total_entries_created,
             'total_deleted': self.total_entries_deleted,
-            'batch_init_done': self.batch_init_done
+            'batch_init_done': self.batch_init_done,
+            'batch_init_buffer_size': len(self.init_buffer_features),
+            # Debug stats
+            'debug_updates_attempted': self._debug_updates_attempted,
+            'debug_updates_low_conf': self._debug_updates_low_conf,
+            'debug_updates_batch_buffered': self._debug_updates_batch_buffered,
+            'debug_entries_matched': self._debug_entries_matched,
+            'debug_entries_created': self._debug_entries_created
         }
     
     def get_class_distribution(self) -> np.ndarray:

@@ -75,14 +75,52 @@ def A_D(kappa: float, dim: int,
     return np.clip(num / denom, 0.0, 1.0 - 1e-10)
 
 
+# LUT cache for A_D_vectorized (key: (dim, kappa_max, kappa_min, step))
+_A_D_LUT_CACHE: Dict[Tuple[int, float, float, float], Tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _build_A_D_LUT(dim: int, kappa_max: float, kappa_min: float, step: float = 0.1
+                   ) -> Tuple[np.ndarray, np.ndarray]:
+    """Build LUT for A_D function using vectorized ive calls."""
+    kappa_grid = np.arange(kappa_min, kappa_max + step, step)
+    v = dim / 2.0
+    
+    # Vectorized ive calls
+    num = ive(v, kappa_grid)
+    denom = ive(v - 1, kappa_grid)
+    
+    # Handle asymptotic case where denom is tiny
+    with np.errstate(divide='ignore', invalid='ignore'):
+        values = num / denom
+    
+    # Fix asymptotic values
+    asymptotic_mask = denom < 1e-300
+    values[asymptotic_mask] = 1.0 - (dim - 1) / (2 * kappa_grid[asymptotic_mask])
+    
+    values = np.clip(values, 0.0, 1.0 - 1e-10)
+    
+    return kappa_grid, values
+
+
 def A_D_vectorized(kappa: np.ndarray, dim: int,
                    kappa_max: float = DEFAULT_KAPPA_MAX,
-                   kappa_min: float = DEFAULT_KAPPA_MIN) -> np.ndarray:
-    """Vectorized version of A_D for arrays."""
-    result = np.zeros_like(kappa, dtype=np.float64)
-    for i, k in enumerate(kappa):
-        result[i] = A_D(k, dim, kappa_max, kappa_min)
-    return result
+                   kappa_min: float = DEFAULT_KAPPA_MIN,
+                   step: float = 0.1) -> np.ndarray:
+    """
+    LUT-based vectorized A_D for arrays.
+    
+    Uses precomputed lookup table with linear interpolation for speed.
+    """
+    # Get or build LUT
+    cache_key = (dim, kappa_max, kappa_min, step)
+    if cache_key not in _A_D_LUT_CACHE:
+        _A_D_LUT_CACHE[cache_key] = _build_A_D_LUT(dim, kappa_max, kappa_min, step)
+    
+    kappa_grid, values = _A_D_LUT_CACHE[cache_key]
+    
+    # Clip kappa to valid range and interpolate
+    kappa_clipped = np.clip(kappa, kappa_min, kappa_max)
+    return np.interp(kappa_clipped, kappa_grid, values)
 
 
 def inv_A_D(r_bar: float, dim: int,
@@ -893,8 +931,8 @@ class TrackSTADvMF:
                 
                 # Add transition prior: pull toward previous prototype
                 # β_k = κ^trans · E_q[w_{t-1,k}] + κ^ems · Σ_n λ_{n,k} · h_n
-                a_d_prev = A_D(self.gamma[k], D, self.config.kappa_max, self.config.kappa_min)
-                m_prev_k = a_d_prev * rho_prev[k]
+                # Reuse pre-computed a_d_gamma[k] instead of calling A_D per class
+                m_prev_k = a_d_gamma[k] * rho_prev[k]
                 
                 s_k_combined = self.kappa_ems * s_k + self.kappa_trans * m_prev_k
                 

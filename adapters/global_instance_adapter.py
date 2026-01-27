@@ -25,6 +25,7 @@ Self-Reinforcement Prevention:
 """
 
 import numpy as np
+import time
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field
 
@@ -240,7 +241,20 @@ class GlobalInstanceAdapter(BaseAdapter):
     
     def _parse_config(self, config: Dict) -> None:
         """Parse configuration dictionary."""
-        params = config.get('params', config)
+        # Handle nested config structure: config["adaptation"]["params"] or config["params"] or config
+        if 'adaptation' in config and isinstance(config['adaptation'], dict):
+            params = config['adaptation'].get('params', config['adaptation'])
+            config_path = 'config["adaptation"]["params"]'
+        elif 'params' in config:
+            params = config['params']
+            config_path = 'config["params"]'
+        else:
+            params = config
+            config_path = 'config (root level)'
+        
+        # Store for debug logging
+        self._config_path = config_path
+        self._raw_params = params
         
         # Mode
         self.mode = params.get('mode', 'full')
@@ -313,6 +327,11 @@ class GlobalInstanceAdapter(BaseAdapter):
             cache_match_threshold=params.get('cache_match_threshold', 0.5)
         )
         
+        # Track creation limits (CRITICAL for performance!)
+        self.track_creation_threshold = params.get('track_creation_threshold', 0.3)  # Only create tracks for high-conf dets
+        self.max_tracks = params.get('max_tracks', 100)  # Limit total tracks
+        self.association_fast_threshold = params.get('association_fast_threshold', 50)  # Use fast IoU-only when > this
+        
         # Association config
         self.association_config = AssociationConfig(
             iou_threshold=params.get('iou_threshold', 0.3),
@@ -340,6 +359,65 @@ class GlobalInstanceAdapter(BaseAdapter):
         
         # Debug
         self.debug = params.get('debug', False)
+        self.debug_every = params.get('debug_every', 30)
+        
+        # Sanity warning thresholds
+        self._warn_cache_empty_after = params.get('warn_cache_empty_after', 50)
+        self._warn_no_stad_after = params.get('warn_no_stad_after', 50)
+        self._debug_log_first_n = params.get('debug_log_first_n', 5)  # Always log first N frames
+        
+        # Debug counters for sanity warnings
+        self._frames_with_empty_cache = 0
+        self._frames_with_no_stad_updates = 0
+        self._total_stad_updates = 0
+        self._total_stad_skipped_low_conf = 0
+        self._total_stad_skipped_no_track = 0
+        
+        # One-time debug print of resolved params
+        if self.debug:
+            print(f"\n{'='*60}")
+            print(f"[GlobalInstanceAdapter] CONFIG DEBUG")
+            print(f"{'='*60}")
+            print(f"  Config path used: {self._config_path}")
+            print(f"  --- Mode & Components ---")
+            print(f"    mode={self.mode}")
+            print(f"    use_global_cache={self.use_global_cache}")
+            print(f"    use_tracking={self.use_tracking}")
+            print(f"    use_track_stad={self.use_track_stad}")
+            print(f"    cascade_mode={self.cascade_mode}")
+            print(f"  --- Global Cache (BCA+) ---")
+            print(f"    tau1={self.cache_config.tau1} (conf threshold for cache UPDATE)")
+            print(f"    tau2_confirmed={self.cache_config.tau2_confirmed} (similarity for MATCH)")
+            print(f"    tau2_tentative={self.cache_config.tau2_tentative}")
+            print(f"    ws={self.cache_config.ws} (scale weight in posterior)")
+            print(f"    logit_temperature={self.cache_config.logit_temperature}")
+            print(f"    max_cache_size={self.cache_config.max_cache_size}")
+            print(f"    use_batch_init={self.cache_config.use_batch_init}")
+            print(f"    batch_init_size={self.cache_config.batch_init_size}")
+            print(f"  --- Per-Track STAD ---")
+            print(f"    ssm_type={self.stad_variant}")
+            print(f"    window_size={self.stad_config.window_size}")
+            print(f"    em_iterations={self.stad_config.em_iterations}")
+            print(f"    min_confidence={self.stad_config.min_confidence} (tau_update for STAD)")
+            print(f"    vlm_prior_weight={self.stad_config.vlm_prior_weight}")
+            print(f"    kappa_trans={self.stad_config.kappa_trans}")
+            print(f"    kappa_ems={self.stad_config.kappa_ems}")
+            print(f"  --- Fusion ---")
+            print(f"    fusion_mode={self.fusion_mode}")
+            print(f"    fusion_init_weight={self.fusion_init_weight}")
+            print(f"    fusion_global_weight={self.fusion_global_weight}")
+            print(f"    fusion_track_weight={self.fusion_track_weight}")
+            print(f"  --- Detection ---")
+            print(f"    detection_threshold={self.detection_threshold}")
+            print(f"    nms_threshold={self.nms_threshold}")
+            print(f"  --- Tracking ---")
+            print(f"    min_hits_to_confirm={self.track_config.min_hits_to_confirm}")
+            print(f"    max_age={self.track_config.max_age}")
+            print(f"    association_method={self.association_method}")
+            print(f"    track_creation_threshold={self.track_creation_threshold} (only track high-conf dets)")
+            print(f"    max_tracks={self.max_tracks} (limit total tracks)")
+            print(f"    association_fast_threshold={self.association_fast_threshold} (use IoU-only when > this)")
+            print(f"{'='*60}\n")
     
     def _init_components(self) -> None:
         """Initialize adaptation components (lazy init for feature_dim)."""
@@ -403,11 +481,27 @@ class GlobalInstanceAdapter(BaseAdapter):
         """
         threshold = threshold or self.detection_threshold
         
+        # Timing accumulators
+        t_start = time.perf_counter()
+        timings = {}
+        
+        # Debug stats for this frame
+        dbg = {
+            'N_raw': 0, 'N_threshold': 0, 'N_nms': 0,
+            'cache_M_before': 0, 'cache_M_after': 0, 'cache_high_conf_count': 0,
+            'adapt_L1_mean': 0.0, 'adapt_L1_max': 0.0,
+            'n_active_tracks': 0, 'n_matches': 0, 'n_unmatched_dets': 0, 'n_unmatched_tracks': 0,
+            'stad_updates': 0, 'stad_skipped_low_conf': 0, 'stad_skipped_no_track': 0,
+            'label_changes': 0
+        }
+        
         # ===== Stage 1: VLM Detection =====
+        t0 = time.perf_counter()
         alpha = self.cache_config.alpha if self.use_global_cache else 0.0
         detection_result = self.detector.detect_with_features(
             image, target_classes, threshold=threshold, alpha=alpha
         )
+        timings['detector'] = time.perf_counter() - t0
         
         if detection_result is None or len(detection_result.boxes) == 0:
             self.frame_count += 1
@@ -433,26 +527,34 @@ class GlobalInstanceAdapter(BaseAdapter):
         # ===== Stage 2: Store RAW VLM probs (BEFORE any adaptation) =====
         raw_vlm_probs = class_probs.copy()
         
-        # ===== Stage 3: Global BCA+ Adaptation =====
+        # ===== Stage 3: Global BCA+ Adaptation (BATCHED) =====
+        t0 = time.perf_counter()
+        dbg['N_raw'] = N
+        dbg['cache_M_before'] = self.global_cache.M if self.global_cache else 0
+        
         if self.use_global_cache and self.global_cache is not None:
-            adapted_probs = np.zeros_like(class_probs)
-            for i in range(N):
-                adapted_probs[i] = self.global_cache.adapt_probs(
-                    features[i], boxes[i], class_probs[i]
-                )
-            global_adapted_probs = adapted_probs
+            global_adapted_probs = self.global_cache.adapt_probs_batch(features, boxes, class_probs)
+            # Compute adaptation effect
+            adapt_diff = np.abs(global_adapted_probs - class_probs)
+            dbg['adapt_L1_mean'] = float(np.mean(adapt_diff))
+            dbg['adapt_L1_max'] = float(np.max(adapt_diff))
         else:
             global_adapted_probs = class_probs.copy()
+        timings['global_cache_adapt'] = time.perf_counter() - t0
         
         # ===== Stage 4: Filter by threshold =====
         keep_mask = scores >= threshold
+        dbg['N_threshold'] = int(np.sum(keep_mask))
         if not keep_mask.any():
             self.frame_count += 1
             self._end_frame()
+            self._debug_log_frame(dbg, timings, t_start)
             return self._create_empty_result(detection_result)
         
         # ===== Stage 5: Apply NMS =====
+        t0 = time.perf_counter()
         nms_indices = self._apply_nms(boxes, scores, keep_mask)
+        timings['nms'] = time.perf_counter() - t0
         
         nms_boxes = boxes[nms_indices]
         nms_scores = scores[nms_indices]
@@ -462,10 +564,20 @@ class GlobalInstanceAdapter(BaseAdapter):
         nms_global_probs = global_adapted_probs[nms_indices]
         
         N_nms = len(nms_indices)
+        dbg['N_nms'] = N_nms
+        dbg['score_min'] = float(nms_scores.min()) if N_nms > 0 else 0.0
+        dbg['score_max'] = float(nms_scores.max()) if N_nms > 0 else 0.0
         
         # ===== Stage 6: Track Association =====
+        t0 = time.perf_counter()
         final_probs = nms_global_probs.copy()
         track_ids = [-1] * N_nms
+        t_stad = 0.0  # Accumulator for STAD updates
+        frame_stad_updates = 0
+        frame_stad_skipped_no_track = 0
+        tracks_created = 0
+        tracks_skipped_low_conf = 0
+        tracks_skipped_max_limit = 0
         
         if self.use_tracking and self.track_manager is not None:
             # Predict existing tracks
@@ -473,10 +585,19 @@ class GlobalInstanceAdapter(BaseAdapter):
             
             # Get track info
             active_tracks = self.track_manager.get_active_tracks()
+            dbg['n_active_tracks'] = len(active_tracks)
             
             if len(active_tracks) > 0:
                 track_boxes = np.array([t.get_state() for t in active_tracks])
                 track_features = np.array([t.get_feature() for t in active_tracks])
+                
+                # Choose association method based on scale
+                n_tracks = len(active_tracks)
+                n_dets = N_nms
+                use_fast = (n_tracks > self.association_fast_threshold or 
+                           n_dets > self.association_fast_threshold)
+                
+                assoc_method = 'iou' if use_fast else self.association_method
                 
                 # Associate
                 matches, unmatched_tracks, unmatched_dets = associate(
@@ -485,11 +606,18 @@ class GlobalInstanceAdapter(BaseAdapter):
                     detection_scores=nms_scores,
                     track_features=track_features,
                     detection_features=nms_features,
-                    method=self.association_method,
+                    method=assoc_method,
                     config=self.association_config
                 )
+                timings['association'] = time.perf_counter() - t0
+                
+                dbg['n_matches'] = len(matches)
+                dbg['n_unmatched_dets'] = len(unmatched_dets)
+                dbg['n_unmatched_tracks'] = len(unmatched_tracks)
+                dbg['association_method_used'] = assoc_method
                 
                 # ===== Stage 7: Update matched tracks and refine probs =====
+                t0 = time.perf_counter()
                 for track_idx, det_idx in matches:
                     track = active_tracks[track_idx]
                     
@@ -504,9 +632,16 @@ class GlobalInstanceAdapter(BaseAdapter):
                         raw_class_probs=nms_raw_probs[det_idx]  # RAW probs for STAD!
                     )
                     
+                    # Track STAD update count before/after
+                    stad_before = track.total_stad_updates if hasattr(track, 'total_stad_updates') else 0
+                    
                     # Update track (STAD uses raw_class_probs internally)
                     track.update(det)
                     track_ids[det_idx] = track.track_id
+                    
+                    stad_after = track.total_stad_updates if hasattr(track, 'total_stad_updates') else 0
+                    if stad_after > stad_before:
+                        frame_stad_updates += 1
                     
                     # Part 5.2: 3-source fusion (p_init, p_global, p_track)
                     if self.use_track_stad and track.class_stad is not None:
@@ -514,9 +649,21 @@ class GlobalInstanceAdapter(BaseAdapter):
                         p_global = nms_global_probs[det_idx]  # Global cache adapted
                         p_track = track.get_class_probs()     # Per-track STAD belief
                         final_probs[det_idx] = self._fuse_probs(p_init, p_global, p_track, track)
+                t_stad = time.perf_counter() - t0
                 
-                # Create new tracks for unmatched detections
+                # Create new tracks for unmatched detections (WITH THRESHOLD!)
+                current_track_count = len(self.track_manager.get_active_tracks())
                 for det_idx in unmatched_dets:
+                    # Check score threshold
+                    if nms_scores[det_idx] < self.track_creation_threshold:
+                        tracks_skipped_low_conf += 1
+                        continue
+                    
+                    # Check max tracks limit
+                    if current_track_count >= self.max_tracks:
+                        tracks_skipped_max_limit += 1
+                        continue
+                    
                     det = Detection(
                         box=nms_boxes[det_idx],
                         score=nms_scores[det_idx],
@@ -528,9 +675,24 @@ class GlobalInstanceAdapter(BaseAdapter):
                     )
                     new_track = self.track_manager.create_track(det)
                     track_ids[det_idx] = new_track.track_id
+                    tracks_created += 1
+                    current_track_count += 1
             else:
-                # No existing tracks - create new ones for all detections
+                timings['association'] = time.perf_counter() - t0
+                dbg['association_method_used'] = 'none'
+                # No existing tracks - create new ones for HIGH-CONF detections only
+                current_track_count = 0
                 for det_idx in range(N_nms):
+                    # Check score threshold
+                    if nms_scores[det_idx] < self.track_creation_threshold:
+                        tracks_skipped_low_conf += 1
+                        continue
+                    
+                    # Check max tracks limit
+                    if current_track_count >= self.max_tracks:
+                        tracks_skipped_max_limit += 1
+                        continue
+                    
                     det = Detection(
                         box=nms_boxes[det_idx],
                         score=nms_scores[det_idx],
@@ -542,9 +704,26 @@ class GlobalInstanceAdapter(BaseAdapter):
                     )
                     new_track = self.track_manager.create_track(det)
                     track_ids[det_idx] = new_track.track_id
+                    tracks_created += 1
+                    current_track_count += 1
+        else:
+            timings['association'] = 0.0
+            frame_stad_skipped_no_track = N_nms  # No tracking means no STAD for any detection
+        
+        dbg['stad_updates'] = frame_stad_updates
+        dbg['stad_skipped_no_track'] = frame_stad_skipped_no_track
+        dbg['tracks_created'] = tracks_created
+        dbg['tracks_skipped_low_conf'] = tracks_skipped_low_conf
+        dbg['tracks_skipped_max_limit'] = tracks_skipped_max_limit
+        timings['stad_update'] = t_stad
         
         # ===== Stage 8: Update Global Cache (CRITICAL: Use RAW VLM probs!) =====
+        t0 = time.perf_counter()
         if self.use_global_cache and self.global_cache is not None:
+            # Count high-confidence detections that will be used to update cache
+            high_conf_mask = nms_scores >= self.cache_config.tau1
+            dbg['cache_high_conf_count'] = int(np.sum(high_conf_mask))
+            
             # Update cache with RAW VLM probs, NOT post-instance probs!
             # This prevents self-reinforcement loop
             self.global_cache.update_cache(
@@ -553,6 +732,8 @@ class GlobalInstanceAdapter(BaseAdapter):
                 probs=nms_raw_probs,  # RAW VLM probs!
                 scores=nms_scores
             )
+            dbg['cache_M_after'] = self.global_cache.M
+        timings['cache_update'] = time.perf_counter() - t0
         
         # ===== Stage 9: Track-to-Cache Feedback (optional) =====
         if (self.use_feedback and self.use_global_cache and 
@@ -562,9 +743,14 @@ class GlobalInstanceAdapter(BaseAdapter):
         # ===== Create output =====
         # Update labels based on final class probs
         final_labels = []
+        label_changes = 0
         for i in range(N_nms):
             top_class_idx = np.argmax(final_probs[i])
-            final_labels.append(self.target_classes[top_class_idx])
+            new_label = self.target_classes[top_class_idx]
+            final_labels.append(new_label)
+            if new_label != nms_labels[i]:
+                label_changes += 1
+        dbg['label_changes'] = label_changes
         
         # Create result
         result = self._create_result(
@@ -581,9 +767,130 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.total_detections += N
         self.total_adapted += N_nms
         
+        # Update debug counters for sanity warnings
+        self._total_stad_updates += frame_stad_updates
+        if self.use_global_cache and dbg['cache_M_after'] == 0:
+            self._frames_with_empty_cache += 1
+        else:
+            self._frames_with_empty_cache = 0
+        if self.use_track_stad and frame_stad_updates == 0:
+            self._frames_with_no_stad_updates += 1
+        else:
+            self._frames_with_no_stad_updates = 0
+        
+        # Print timing and debug info every debug_every frames
+        timings['total'] = time.perf_counter() - t_start
+        self._debug_log_frame(dbg, timings, t_start)
+        
         self._end_frame()
         
         return result
+    
+    def _debug_log_frame(self, dbg: Dict, timings: Dict, t_start: float) -> None:
+        """Print per-frame debug info and sanity warnings."""
+        if not self.debug:
+            return
+        
+        should_log = (self.frame_count % self.debug_every == 0) or (self.frame_count <= self._debug_log_first_n)
+        
+        # Always check sanity warnings
+        if self.use_global_cache and self._frames_with_empty_cache >= self._warn_cache_empty_after:
+            print(f"\n⚠️  [SANITY WARNING] Frame {self.frame_count}: Global cache has been EMPTY for "
+                  f"{self._frames_with_empty_cache} frames!")
+            print(f"    - use_global_cache={self.use_global_cache}, tau1={self.cache_config.tau1}")
+            print(f"    - High-conf detections this frame: {dbg.get('cache_high_conf_count', 0)}")
+            if self.global_cache:
+                summary = self.global_cache.get_summary()
+                print(f"    - Batch init: done={summary['batch_init_done']}, buffer_size={summary['batch_init_buffer_size']}")
+                print(f"    - Total updates attempted: {summary['debug_updates_attempted']}")
+                print(f"    - Updates filtered (low conf): {summary['debug_updates_low_conf']}")
+                print(f"    - Updates buffered (batch init): {summary['debug_updates_batch_buffered']}")
+            print(f"    - Check: Are scores >= tau1? Is batch_init_size too high?\n")
+        
+        if self.use_track_stad and self._frames_with_no_stad_updates >= self._warn_no_stad_after:
+            print(f"\n⚠️  [SANITY WARNING] Frame {self.frame_count}: NO STAD updates for "
+                  f"{self._frames_with_no_stad_updates} frames!")
+            print(f"    - use_track_stad={self.use_track_stad}, min_confidence={self.stad_config.min_confidence}")
+            print(f"    - Total STAD updates so far: {self._total_stad_updates}")
+            print(f"    - Check: Are tracks being created? Are scores >= min_confidence?\n")
+        
+        if not should_log:
+            return
+        
+        # Per-frame debug log
+        print(f"\n{'─'*70}")
+        print(f"[Frame {self.frame_count}] DEBUG STATS")
+        print(f"{'─'*70}")
+        
+        # Detection pipeline
+        print(f"  📦 Detections: N_raw={dbg['N_raw']} → N_threshold={dbg['N_threshold']} → N_nms={dbg['N_nms']}")
+        
+        # Score distribution
+        if 'score_min' in dbg and 'score_max' in dbg:
+            print(f"       Scores: min={dbg['score_min']:.3f}, max={dbg['score_max']:.3f}, "
+                  f">=tau1({self.cache_config.tau1}): {dbg['cache_high_conf_count']}")
+        
+        # Global cache
+        if self.use_global_cache:
+            print(f"  🗃️  Cache: M={dbg['cache_M_before']}→{dbg['cache_M_after']}, "
+                  f"high_conf_updates={dbg['cache_high_conf_count']} (need score≥{self.cache_config.tau1})")
+            if self.global_cache:
+                summary = self.global_cache.get_summary()
+                if not summary['batch_init_done']:
+                    print(f"       Batch init: collecting {summary['batch_init_buffer_size']}/{self.cache_config.batch_init_size}")
+            print(f"       Adapt effect: L1_mean={dbg['adapt_L1_mean']:.4f}, L1_max={dbg['adapt_L1_max']:.4f}")
+            if dbg['adapt_L1_max'] < 0.001 and dbg['cache_M_before'] > 0:
+                print(f"       ⚠️  Adaptation has MINIMAL effect on probs!")
+        else:
+            print(f"  🗃️  Cache: DISABLED (use_global_cache=False)")
+        
+        # Tracking
+        if self.use_tracking:
+            assoc_method = dbg.get('association_method_used', self.association_method)
+            n_tentative = len(self.track_manager.get_tentative_tracks()) if self.track_manager else 0
+            n_confirmed = len(self.track_manager.get_confirmed_tracks()) if self.track_manager else 0
+            print(f"  🎯 Tracking: active={dbg['n_active_tracks']} (tentative={n_tentative}, confirmed={n_confirmed})")
+            print(f"       matches={dbg['n_matches']}, unmatched_dets={dbg['n_unmatched_dets']}, unmatched_tracks={dbg['n_unmatched_tracks']}")
+            print(f"       Association: method={assoc_method} (fast_threshold={self.association_fast_threshold})")
+            print(f"       New tracks: created={dbg.get('tracks_created', 0)}, "
+                  f"skipped_low_conf={dbg.get('tracks_skipped_low_conf', 0)} (need ≥{self.track_creation_threshold}), "
+                  f"skipped_max_limit={dbg.get('tracks_skipped_max_limit', 0)} (max={self.max_tracks})")
+            if n_confirmed == 0 and dbg['n_active_tracks'] > 0:
+                print(f"       ℹ️  Tracks are TENTATIVE (need {self.track_config.min_hits_to_confirm} hits to confirm)")
+        else:
+            print(f"  🎯 Tracking: DISABLED (use_tracking=False)")
+        
+        # STAD
+        if self.use_track_stad:
+            print(f"  📈 STAD: updates={dbg['stad_updates']}, skipped_no_track={dbg['stad_skipped_no_track']} "
+                  f"(need score≥{self.stad_config.min_confidence})")
+            print(f"       Total STAD updates so far: {self._total_stad_updates}")
+            if dbg['stad_updates'] == 0 and dbg['n_matches'] > 0:
+                print(f"       ⚠️  Matched {dbg['n_matches']} tracks but 0 STAD updates!")
+        else:
+            print(f"  📈 STAD: DISABLED (use_track_stad=False)")
+        
+        # Label changes
+        print(f"  🏷️  Label changes: {dbg['label_changes']}/{dbg['N_nms']} detections changed class")
+        if dbg['label_changes'] == 0 and dbg['N_nms'] > 0 and (self.use_global_cache or self.use_track_stad):
+            if dbg['cache_M_before'] == 0 and self.use_global_cache:
+                print(f"       ℹ️  No label changes because cache is empty (still initializing)")
+            else:
+                print(f"       ⚠️  No label changes despite adaptation being enabled!")
+        
+        # Timings
+        timing_str = ' | '.join(f"{k}={v*1000:.1f}ms" for k, v in timings.items())
+        print(f"  ⏱️  Timing: {timing_str}")
+        
+        # Timing analysis
+        if timings.get('total', 0) > 1.0:  # > 1 second
+            print(f"       ⚠️  SLOW FRAME! Breakdown:")
+            for k, v in sorted(timings.items(), key=lambda x: -x[1]):
+                if v > 0.1:  # > 100ms
+                    pct = 100 * v / timings['total']
+                    print(f"          {k}: {v*1000:.0f}ms ({pct:.0f}%)")
+        
+        print(f"{'─'*70}\n")
     
     def _fuse_probs(self, p_init: np.ndarray, p_global: np.ndarray, 
                     p_track: np.ndarray, track: Optional['Track'] = None) -> np.ndarray:
@@ -805,7 +1112,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         # self._components_initialized = False
     
     def get_summary(self) -> Dict:
-        """Get adapter summary."""
+        """Get adapter summary including debug stats."""
         summary = {
             'mode': self.mode,
             'frame_count': self.frame_count,
@@ -813,7 +1120,21 @@ class GlobalInstanceAdapter(BaseAdapter):
             'total_adapted': self.total_adapted,
             'use_global_cache': self.use_global_cache,
             'use_tracking': self.use_tracking,
-            'use_track_stad': self.use_track_stad
+            'use_track_stad': self.use_track_stad,
+            # Debug counters
+            'total_stad_updates': self._total_stad_updates,
+            'frames_with_empty_cache': self._frames_with_empty_cache,
+            'frames_with_no_stad_updates': self._frames_with_no_stad_updates,
+            # Config values for verification
+            'config': {
+                'tau1': self.cache_config.tau1,
+                'tau2': self.cache_config.tau2_confirmed,
+                'ws': self.cache_config.ws,
+                'detection_threshold': self.detection_threshold,
+                'fusion_mode': self.fusion_mode,
+                'ssm_type': self.stad_variant,
+                'em_iterations': self.stad_config.em_iterations
+            }
         }
         
         if self.global_cache is not None:
