@@ -119,13 +119,13 @@ def get_ablation_config(mode: str) -> Dict:
         'nms_threshold': 0.7,
         'debug': False,
         
-        # Global cache params (matching bca_plus.json structure)
+        # Global cache params (matching original BCA+ behavior)
         'tau1': 0.6,
-        'tau2': 0.9,
-        'ws': 0.1,
+        'tau2': 0.5,  # Single tau2 like original BCA+ (lower = more aggressive merging)
+        'ws': 0.2,
         'logit_temperature': 10.0,
         'alpha': 0.3,
-        'tau2_init': 0.8,
+        'tau2_init': 0.5,  # Batch init clustering threshold
         'max_cache_size': 25,
         
         # STAD params (matching temporal_tta_vmf_v2.json structure)
@@ -267,14 +267,13 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.detection_threshold = params.get('detection_threshold', params.get('tau_update', 0.10))
         self.nms_threshold = params.get('nms_threshold', params.get('iou_threshold', 0.7))
         
-        # Global cache config
+        # Global cache config (using single tau2 like original BCA+)
         self.cache_config = EnhancedBCAPlusConfig(
             tau1=params.get('tau1', 0.6),
-            tau2_confirmed=params.get('tau2', params.get('tau2_confirmed', 0.9)),
-            tau2_tentative=params.get('tau2_tentative', 0.85),
-            tau2_init=params.get('tau2_init', 0.8),
+            tau2=params.get('tau2', 0.5),  # Single tau2 like original BCA+
+            tau2_init=params.get('tau2_init', 0.5),
             max_cache_size=params.get('max_cache_size', 25),
-            ws=params.get('ws', 0.1),
+            ws=params.get('ws', 0.2),
             alpha=params.get('alpha', 0.3),
             logit_temperature=params.get('logit_temperature', 10.0),
             min_hits_to_confirm=params.get('min_hits_to_confirm', 3),
@@ -387,8 +386,8 @@ class GlobalInstanceAdapter(BaseAdapter):
             print(f"    cascade_mode={self.cascade_mode}")
             print(f"  --- Global Cache (BCA+) ---")
             print(f"    tau1={self.cache_config.tau1} (conf threshold for cache UPDATE)")
-            print(f"    tau2_confirmed={self.cache_config.tau2_confirmed} (similarity for MATCH)")
-            print(f"    tau2_tentative={self.cache_config.tau2_tentative}")
+            print(f"    tau2={self.cache_config.tau2} (similarity for MATCH - single threshold like original BCA+)")
+            print(f"    tau2_init={self.cache_config.tau2_init} (batch init clustering threshold)")
             print(f"    ws={self.cache_config.ws} (scale weight in posterior)")
             print(f"    logit_temperature={self.cache_config.logit_temperature}")
             print(f"    max_cache_size={self.cache_config.max_cache_size}")
@@ -502,6 +501,13 @@ class GlobalInstanceAdapter(BaseAdapter):
             image, target_classes, threshold=threshold, alpha=alpha
         )
         timings['detector'] = time.perf_counter() - t0
+        
+        # Set image size on cache (needed for scale normalization - Eq. 8)
+        if self.use_global_cache and self.global_cache is not None:
+            if hasattr(image, 'size'):
+                self.global_cache.image_size = image.size  # PIL: (width, height)
+            elif hasattr(image, 'shape'):
+                self.global_cache.image_size = (image.shape[1], image.shape[0])  # numpy: (H,W,C)
         
         if detection_result is None or len(detection_result.boxes) == 0:
             self.frame_count += 1
@@ -1128,7 +1134,7 @@ class GlobalInstanceAdapter(BaseAdapter):
             # Config values for verification
             'config': {
                 'tau1': self.cache_config.tau1,
-                'tau2': self.cache_config.tau2_confirmed,
+                'tau2': self.cache_config.tau2,
                 'ws': self.cache_config.ws,
                 'detection_threshold': self.detection_threshold,
                 'fusion_mode': self.fusion_mode,

@@ -30,10 +30,9 @@
             
             "_comment_global": "=== Global BCA+ Cache Configuration ===",
             "use_global_cache": true,
-            "tau1": 0.7,
-            "tau2": 0.9,
-            "tau2_tentative": 0.9,
-            "tau2_init": 0.7,
+            "tau1": 0.9,
+            "tau2": 0.6,
+            "tau2_init": 0.55,
             "max_cache_size": 25,
             "ws": 0.2,
             "alpha": 0.1,
@@ -44,7 +43,7 @@
             "_comment_tracking": "=== Tracking Configuration ===",
             "use_tracking": true,
             "min_hits_to_confirm": 3,
-            "max_age": 30,
+            "max_age": 20,
             "feature_alpha": 0.1,
             "association_method": "bytetrack",
             "_association_options": "iou | hungarian | combined | bytetrack",
@@ -54,7 +53,7 @@
             "low_score_threshold": 0.1,
 
             "_comment_track_limits": "=== Track Creation Limits (CRITICAL for performance!) ===",
-            "track_creation_threshold": 0.8,
+            "track_creation_threshold": 0.9,
             "_track_creation_note": "Only create tracks for detections with score >= this",
             "max_tracks": 100,
             "_max_tracks_note": "Limit total active tracks to prevent O(n^3) association blowup",
@@ -63,7 +62,7 @@
             
             "_comment_stad": "=== Per-Track STAD Configuration ===",
             "use_track_stad": true,
-            "ssm_type": "vmf",
+            "ssm_type": "gaussian",
             "_ssm_type_options": "vmf | gaussian",
             
             "_comment_vmf": "=== STAD-vMF Parameters (matching temporal_ssm_v2.py) ===",
@@ -122,7 +121,7 @@
             "fusion_confidence_threshold": 0.7,
             
             "_comment_debug": "=== Debug ===",
-            "debug": false,
+            "debug": true,
             "debug_every": 30
         }
     },
