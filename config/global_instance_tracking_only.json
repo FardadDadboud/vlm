@@ -1,0 +1,74 @@
+{
+  "description": "TRACKING ONLY mode - Tests tracking impact on mAP via score modulation + phantom detections",
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "output_dir": "./shift_tracking_debug_results",
+  "filters": {
+    "weather": ["clear"],
+    "time": ["daytime"],
+    "max_frames_per_video": null
+  },
+  "max_samples": null,
+  "num_visualizations": 1000,
+  "detector": {
+    "name": "grounding-dino",
+    "model_path": "IDEA-Research/grounding-dino-base",
+    "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
+    "threshold": 0.1,
+    "iou_threshold": 0.7
+  },
+  "adaptation": {
+    "type": "global_instance",
+    "params": {
+      "mode": "tracking_only",
+      "output_dir": "./shift_tracking_debug_results",
+      
+      "use_global_cache": false,
+      "use_tracking": true,
+      "use_track_stad": false,
+      
+      "_comment_tracking": "=== Tracking Settings ===",
+      "min_hits_to_confirm": 3,
+      "max_age": 20,
+      "feature_alpha": 0.1,
+      "association_method": "bytetrack",
+      "iou_threshold": 0.5,
+      "high_score_threshold": 0.9,
+      "low_score_threshold": 0.8,
+      "track_creation_threshold": 0.7,
+      "max_tracks": 100,
+      "association_fast_threshold": 50,
+      
+      "_comment_prefilter": "=== Pre-filtering for tracking only (keeps all detections in output) ===",
+      "aggressive_prefilter": false,
+      
+      "_comment_phantom": "=== Phantom Detections (output predicted boxes for missed detections) ===",
+      "use_predicted_for_missed": true,
+      "predicted_score_decay": 0.9,
+      "predicted_min_score": 0.3,
+      "predicted_max_frames": 3,
+      
+      "_comment_score_mod": "=== Score Modulation (makes tracking impact mAP!) ===",
+      "use_track_score_modulation": true,
+      "force_score_modulation": false,
+      "confirmed_track_boost": 0.1,
+      "tentative_track_penalty": 0.0,
+      "untracked_penalty": 0.05,
+      "filter_untracked": false,
+      
+      "_comment_smoothing": "=== Temporal Score Smoothing (optional) ===",
+      "use_temporal_score_smoothing": true,
+      "score_smoothing_alpha": 0.3,
+      "score_smoothing_window": 5,
+      
+      "nms_threshold": 0.7,
+      
+      "visual_debug": true,
+      
+      "debug": true,
+      "debug_every": 10
+    }
+  },
+  "reset_on_video_change": true,
+  "process_by_video": true
+}

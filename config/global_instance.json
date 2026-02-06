@@ -1,131 +1,119 @@
 {
-    "description": "Global+Instance TTA configuration combining BCA+ global cache with per-track STAD for SHIFT dataset evaluation",
-    
-    "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
-    "split": "val",
-    "output_dir": "./shift_global_instance_results",
-    
-    "filters": {
-        "weather": ["clear"],
-        "time": ["daytime"],
-        "max_frames_per_video": null
-    },
-    "max_samples": null,    
-    "num_visualizations": 1000,
-    
-    "detector": {
-        "name": "grounding-dino",
-        "model_path": "IDEA-Research/grounding-dino-base",
-        "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
-        "threshold": 0.10,
-        "iou_threshold": 0.7
-    },
-    
-    "adaptation": {
-        "type": "global_instance",
-        "params": {
-            "_comment": "=== Ablation Mode ===",
-            "mode": "full",
-            "_mode_options": "vanilla | global_only | instance_only | full | cascade",
-            
-            "_comment_global": "=== Global BCA+ Cache Configuration ===",
-            "use_global_cache": true,
-            "tau1": 0.9,
-            "tau2": 0.6,
-            "tau2_init": 0.55,
-            "max_cache_size": 25,
-            "ws": 0.2,
-            "alpha": 0.1,
-            "logit_temperature": 10.0,
-            "use_batch_init": true,
-            "batch_init_size": 10,
-            
-            "_comment_tracking": "=== Tracking Configuration ===",
-            "use_tracking": true,
-            "min_hits_to_confirm": 3,
-            "max_age": 20,
-            "feature_alpha": 0.1,
-            "association_method": "bytetrack",
-            "_association_options": "iou | hungarian | combined | bytetrack",
-            "iou_threshold": 0.3,
-            "feature_threshold": 0.5,
-            "high_score_threshold": 0.6,
-            "low_score_threshold": 0.1,
+  "description": "Global+Instance TTA configuration - FULL mode with all components",
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "output_dir": "./shift_global_instance_results",
+  "filters": {
+    "weather": ["clear"],
+    "time": ["daytime"],
+    "max_frames_per_video": null
+  },
+  "max_samples": null,
+  "num_visualizations": 1000,
+  "detector": {
+    "name": "grounding-dino",
+    "model_path": "IDEA-Research/grounding-dino-base",
+    "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
+    "threshold": 0.1,
+    "iou_threshold": 0.7
+  },
+  "adaptation": {
+    "type": "global_instance",
+    "params": {
+      "mode": "full",
+      "_mode_options": "vanilla | global_only | instance_only | tracking_only | full | cascade",
 
-            "_comment_track_limits": "=== Track Creation Limits (CRITICAL for performance!) ===",
-            "track_creation_threshold": 0.9,
-            "_track_creation_note": "Only create tracks for detections with score >= this",
-            "max_tracks": 100,
-            "_max_tracks_note": "Limit total active tracks to prevent O(n^3) association blowup",
-            "association_fast_threshold": 50,
-            "_association_fast_note": "Use fast IoU-only association when tracks or dets exceed this",
-            
-            "_comment_stad": "=== Per-Track STAD Configuration ===",
-            "use_track_stad": true,
-            "ssm_type": "gaussian",
-            "_ssm_type_options": "vmf | gaussian",
-            
-            "_comment_vmf": "=== STAD-vMF Parameters (matching temporal_ssm_v2.py) ===",
-            "kappa_trans": 50.0,
-            "kappa_ems": 5.0,
-            "gamma_init": 10.0,
-            "kappa_max": 50.0,
-            "kappa_min": 1e-6,
-            "gamma_max": 200.0,
-            "gamma_min": 1.0,
-            "gamma_ema_decay": 0.7,
-            
-            "_comment_em": "=== Windowed EM Parameters ===",
-            "window_size": 5,
-            "em_iterations": 3,
-            "min_updates_per_class": 0.5,
-            "max_rk_fraction": 0.5,
-            
-            "_comment_fusion": "=== Fusion Parameters ===",
-            "temperature": 5.0,
-            "vlm_prior_weight": 0.2,
-            
-            "_comment_pi": "=== Mixing Coefficients (π) ===",
-            "use_pi": true,
-            "use_ema_pi": false,
-            "pi_ema_decay": 1.0,
-            "dirichlet_alpha": 0.1,
-            
-            "_comment_gaussian": "=== STAD-Gaussian Parameters (if ssm_type=gaussian) ===",
-            "q_scale": 0.01,
-            "r_base": 0.5,
-            "use_diagonal_cov": true,
-            "use_smoothing": false,
-            
-            "_comment_update": "=== Update Control ===",
-            "tau_update": 0.3,
-            "detection_threshold": 0.10,
-            "nms_threshold": 0.7,
-            
-            "_comment_part53": "=== Part 5.3: Track Init from Global Cache ===",
-            "init_from_cache": true,
-            "cache_match_threshold": 0.5,
-            
-            "_comment_feedback": "=== Track-to-Cache Feedback ===",
-            "use_track_to_cache_feedback": true,
-            "feedback_min_hits": 5,
-            "feedback_min_confidence": 0.8,
-            "feedback_weight": 0.5,
-            
-            "_comment_fusion": "=== Part 5.2: 3-Source Fusion ===",
-            "fusion_mode": "entropy_weighted",
-            "_fusion_mode_options": "entropy_weighted | hierarchical | parallel | selection",
-            "fusion_init_weight": 0.1,
-            "fusion_global_weight": 0.3,
-            "fusion_track_weight": 0.6,
-            "fusion_confidence_threshold": 0.7,
-            
-            "_comment_debug": "=== Debug ===",
-            "debug": true,
-            "debug_every": 30
-        }
-    },
-    
-    "reset_on_video_change": true,
-    "process_by_video": true
-  }
+      "_comment1": "=== Global BCA+ Cache ===",
+      "use_global_cache": true,
+      "tau1": 0.5,
+      "tau2": 0.7,
+      "tau2_init": 0.55,
+      "max_cache_size": 25,
+      "ws": 0.1,
+      "alpha": 0.5,
+      "logit_temperature": 10.0,
+      "use_batch_init": true,
+      "batch_init_size": 10,
+
+      "_comment2": "=== Tracking ===",
+      "use_tracking": true,
+      "min_hits_to_confirm": 3,
+      "max_age": 20,
+      "feature_alpha": 0.1,
+      "association_method": "bytetrack",
+      "iou_threshold": 0.3,
+      "high_score_threshold": 0.8,
+      "low_score_threshold": 0.6,
+      "track_creation_threshold": 0.5,
+      "max_tracks": 100,
+      "association_fast_threshold": 50,
+
+      "_comment3": "=== Score Modulation (CRITICAL for tracking to impact mAP!) ===",
+      "use_track_score_modulation": true,
+      "confirmed_track_boost": 0.1,
+      "tentative_track_penalty": 0.0,
+      "untracked_penalty": 0.05,
+      "filter_untracked": false,
+
+      "_comment3b": "=== Temporal Score Smoothing (optional) ===",
+      "use_temporal_score_smoothing": false,
+      "score_smoothing_alpha": 0.3,
+      "score_smoothing_window": 5,
+
+      "_comment4": "=== Per-Track STAD ===",
+      "use_track_stad": true,
+      "ssm_type": "gaussian",
+      "kappa_trans": 10.0,
+      "kappa_ems": 20.0,
+      "gamma_init": 10.0,
+      "kappa_max": 100.0,
+      "kappa_min": 1e-06,
+      "gamma_max": 200.0,
+      "gamma_min": 1.0,
+      "gamma_ema_decay": 0.7,
+      "window_size": 5,
+      "em_iterations": 3,
+      "min_updates_per_class": 2,
+      "max_rk_fraction": 0.5,
+      "temperature": 1.0,
+      "vlm_prior_weight": 0.2,
+      "use_pi": true,
+      "use_ema_pi": false,
+      "pi_ema_decay": 1.0,
+      "dirichlet_alpha": 0.1,
+      "q_scale": 0.05,
+      "r_base": 0.5,
+      "use_diagonal_cov": true,
+      "use_smoothing": false,
+
+      "_comment5": "=== Detection (threshold fallback only - usually set by detector) ===",
+      "tau_update": 0.5,
+      "nms_threshold": 0.7,
+
+      "_comment6": "=== Track Init from Cache ===",
+      "init_from_cache": true,
+      "cache_match_threshold": 0.5,
+
+      "_comment7": "=== Track-to-Cache Feedback ===",
+      "use_track_to_cache_feedback": true,
+      "feedback_min_hits": 5,
+      "feedback_min_confidence": 0.8,
+      "feedback_weight": 0.5,
+
+      "_comment8": "=== Probability Fusion ===",
+      "fusion_mode": "entropy_weighted",
+      "fusion_init_weight": 0.1,
+      "fusion_global_weight": 0.3,
+      "fusion_track_weight": 0.6,
+      "fusion_confidence_threshold": 0.7,
+
+      "_comment9": "=== Debug ===",
+      "visual_debug": false,
+      "visual_debug_dir": "./tracking_debug",
+      "debug": true,
+      "debug_every": 30
+    }
+  },
+  "reset_on_video_change": true,
+  "process_by_video": true
+}
