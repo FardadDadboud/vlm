@@ -133,6 +133,8 @@ def get_ablation_config(mode: str) -> Dict:
         'alpha': 0.3,
         'tau2_init': 0.5,  # Batch init clustering threshold
         'max_cache_size': 25,
+        'min_hits_to_confirm_cache': 1,
+        'max_age_cache': 999999,
         
         # STAD params (matching temporal_tta_vmf_v2.json structure)
         'ssm_type': 'vmf',
@@ -146,7 +148,7 @@ def get_ablation_config(mode: str) -> Dict:
         'window_size': 5,
         'em_iterations': 3,
         'tau_update': 0.5,
-        'min_updates_per_class': 1,
+        'min_updates_per_class': 0.5,
         'vlm_prior_weight': 0.2,
         'use_pi': True,
         'temperature': 1.0,
@@ -434,8 +436,8 @@ class GlobalInstanceAdapter(BaseAdapter):
             ws=params.get('ws', 0.2),
             alpha=params.get('alpha', 0.3),
             logit_temperature=params.get('logit_temperature', 10.0),
-            min_hits_to_confirm=params.get('min_hits_to_confirm', 3),
-            max_age=params.get('max_age', 30),
+            min_hits_to_confirm_cache=params.get('min_hits_to_confirm_cache', 3),
+            max_age_cache=params.get('max_age_cache', 30),
             use_batch_init=params.get('use_batch_init', True),
             batch_init_size=params.get('batch_init_size', 10),
             debug=params.get('debug', False)
@@ -521,6 +523,11 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.score_smoothing_alpha = params.get('score_smoothing_alpha', 0.3)  # EMA weight for history
         self.score_smoothing_window = params.get('score_smoothing_window', 5)  # Max history to use
         
+        # Use STAD-adapted scores when score modulation is auto-disabled
+        # When True: final_score = max(final_probs) so STAD affects ranking
+        # When False: final_score = original VLM score (STAD only affects labels)
+        self.use_stad_adapted_scores = params.get('use_stad_adapted_scores', True)
+        
         # Association config
         # NOTE: feature_threshold is defined in AssociationConfig but UNUSED in all association methods!
         # Keeping minimal config with only used params
@@ -536,6 +543,12 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.feedback_min_hits = params.get('feedback_min_hits', 5)
         self.feedback_min_confidence = params.get('feedback_min_confidence', 0.8)
         self.feedback_weight = params.get('feedback_weight', 0.5)
+        
+        # Cache update probs: Use adapted (fused) probs or raw VLM probs?
+        # Original BCA+ uses ADAPTED probs for cache V update
+        # Setting to True matches original BCA+ behavior
+        # Setting to False prevents self-reinforcement but may underperform
+        self.use_adapted_probs_for_cache = params.get('use_adapted_probs_for_cache', True)
         
         # Fusion config (Part 5.2)
         # Modes: 'entropy_weighted', 'hierarchical', 'parallel', 'selection'
@@ -592,6 +605,8 @@ class GlobalInstanceAdapter(BaseAdapter):
         print(f"    max_cache_size={self.cache_config.max_cache_size}")
         print(f"    use_batch_init={self.cache_config.use_batch_init}")
         print(f"    batch_init_size={self.cache_config.batch_init_size}")
+        print(f"    min_hits_to_confirm_cache={self.cache_config.min_hits_to_confirm_cache}")
+        print(f"    max_age_cache={self.cache_config.max_age_cache}")
         print(f"  --- Per-Track STAD ---")
         print(f"    ssm_type={self.stad_variant}")
         print(f"    window_size={self.stad_config.window_size}")
@@ -632,6 +647,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         print(f"    use_temporal_score_smoothing={self.use_temporal_score_smoothing}")
         print(f"    score_smoothing_alpha={self.score_smoothing_alpha} (EMA weight for history)")
         print(f"    score_smoothing_window={self.score_smoothing_window} (max history length)")
+        print(f"    use_stad_adapted_scores={self.use_stad_adapted_scores} (use max(fused_probs) as score)")
         print(f"  --- Visual Debug ---")
         print(f"    visual_debug={self.visual_debug}")
         print(f"    visual_debug_dir={self.visual_debug_dir}")
@@ -761,14 +777,33 @@ class GlobalInstanceAdapter(BaseAdapter):
         dbg['N_raw'] = N
         dbg['cache_M_before'] = self.global_cache.M if self.global_cache else 0
         
+        # Store posteriors for cache update (frozen snapshot - matches original BCA+!)
+        cache_posteriors = None
+        
         if self.use_global_cache and self.global_cache is not None:
-            global_adapted_probs = self.global_cache.adapt_probs_batch(features, boxes, class_probs)
+            # CRITICAL: Get posteriors computed against FROZEN cache snapshot!
+            # These will be used for cache update to match original BCA+ behavior
+            global_adapted_probs, cache_posteriors = self.global_cache.adapt_probs_batch(
+                features, boxes, class_probs, return_posteriors=True
+            )
             # Compute adaptation effect
             adapt_diff = np.abs(global_adapted_probs - class_probs)
             dbg['adapt_L1_mean'] = float(np.mean(adapt_diff))
             dbg['adapt_L1_max'] = float(np.max(adapt_diff))
+            
+            # CRITICAL FIX: Update scores and labels from adapted probs (matching original BCA+!)
+            # In original BCA+, adapted class_probs determine scores and labels for filtering/NMS
+            adapted_scores = np.max(global_adapted_probs, axis=1)  # Score = max class prob
+            adapted_label_indices = np.argmax(global_adapted_probs, axis=1)
+            adapted_labels = [self.target_classes[idx] for idx in adapted_label_indices]
+            
+            # Use adapted scores for filtering and NMS
+            scores = adapted_scores
+            labels = adapted_labels
+            dbg['used_adapted_scores'] = True
         else:
             global_adapted_probs = class_probs.copy()
+            dbg['used_adapted_scores'] = False
         timings['global_cache_adapt'] = time.perf_counter() - t0
         
         # ===== Stage 4: Filter by threshold =====
@@ -791,6 +826,8 @@ class GlobalInstanceAdapter(BaseAdapter):
         nms_features = features[nms_indices]
         nms_raw_probs = raw_vlm_probs[nms_indices]  # RAW VLM probs for cache update!
         nms_global_probs = global_adapted_probs[nms_indices]
+        # CRITICAL: Also filter posteriors by NMS indices for cache update!
+        nms_posteriors = cache_posteriors[nms_indices] if cache_posteriors is not None else None
         
         N_nms = len(nms_indices)
         dbg['N_nms'] = N_nms
@@ -874,16 +911,21 @@ class GlobalInstanceAdapter(BaseAdapter):
                 
                 # ===== Stage 7: Update matched tracks and refine probs =====
                 t0 = time.perf_counter()
+                stad_class_changes = 0  # Count class changes from STAD
+                
                 for track_idx, det_idx in matches:
                     track = active_tracks[track_idx]
                     orig_idx = track_indices[det_idx]  # Map back to original nms_* index
+                    
+                    # Store original class for comparison
+                    orig_class_idx = self.target_classes.index(nms_labels[orig_idx]) if nms_labels[orig_idx] in self.target_classes else 0
                     
                     # Create detection object (with RAW probs for STAD update!)
                     det = Detection(
                         box=nms_boxes[orig_idx],
                         score=nms_scores[orig_idx],
                         label=nms_labels[orig_idx],
-                        class_idx=self.target_classes.index(nms_labels[orig_idx]) if nms_labels[orig_idx] in self.target_classes else 0,
+                        class_idx=orig_class_idx,
                         class_probs=nms_global_probs[orig_idx],
                         feature=nms_features[orig_idx],
                         raw_class_probs=nms_raw_probs[orig_idx]  # RAW probs for STAD!
@@ -906,6 +948,13 @@ class GlobalInstanceAdapter(BaseAdapter):
                         p_global = nms_global_probs[orig_idx]  # Global cache adapted
                         p_track = track.get_class_probs()     # Per-track STAD belief
                         final_probs[orig_idx] = self._fuse_probs(p_init, p_global, p_track, track)
+                        
+                        # Check if STAD changed the class
+                        stad_class_idx = np.argmax(p_track)
+                        if stad_class_idx != orig_class_idx:
+                            stad_class_changes += 1
+                
+                dbg['stad_class_changes'] = stad_class_changes
                 t_stad = time.perf_counter() - t0
                 
                 # Create new tracks for unmatched detections (WITH THRESHOLD!)
@@ -983,20 +1032,33 @@ class GlobalInstanceAdapter(BaseAdapter):
         dbg['tracks_skipped_max_limit'] = tracks_skipped_max_limit
         timings['stad_update'] = t_stad
         
-        # ===== Stage 8: Update Global Cache (CRITICAL: Use RAW VLM probs!) =====
+        # ===== Stage 8: Update Global Cache =====
+        # NOTE: Original BCA+ uses ADAPTED probs for cache V update.
+        # use_adapted_probs_for_cache=True matches original behavior.
+        # CRITICAL: Pass pre-computed posteriors for frozen snapshot matching!
         t0 = time.perf_counter()
         if self.use_global_cache and self.global_cache is not None:
             # Count high-confidence detections that will be used to update cache
             high_conf_mask = nms_scores >= self.cache_config.tau1
             dbg['cache_high_conf_count'] = int(np.sum(high_conf_mask))
             
-            # Update cache with RAW VLM probs, NOT post-instance probs!
-            # This prevents self-reinforcement loop
+            # Choose which probs to use for cache V update
+            if self.use_adapted_probs_for_cache:
+                # Match original BCA+: use adapted (fused) probs
+                cache_update_probs = nms_global_probs
+                dbg['cache_update_probs'] = 'adapted'
+            else:
+                # Alternative: use raw VLM probs (prevents self-reinforcement)
+                cache_update_probs = nms_raw_probs
+                dbg['cache_update_probs'] = 'raw'
+            
+            # CRITICAL: Pass pre-computed posteriors (frozen snapshot - matches original BCA+!)
             self.global_cache.update_cache(
                 features=nms_features,
                 boxes=nms_boxes,
-                probs=nms_raw_probs,  # RAW VLM probs!
-                scores=nms_scores
+                probs=cache_update_probs,
+                scores=nms_scores,
+                posteriors=nms_posteriors  # PRE-COMPUTED against frozen cache!
             )
             dbg['cache_M_after'] = self.global_cache.M
         timings['cache_update'] = time.perf_counter() - t0
@@ -1066,7 +1128,18 @@ class GlobalInstanceAdapter(BaseAdapter):
                 track_ids = [track_ids[i] for i in keep_indices]
                 N_nms = len(keep_indices)
         else:
-            final_scores = nms_scores  # No modulation
+            # Score modulation disabled (STAD active)
+            # Option: use max(final_probs) as score for TRACKED detections only
+            if self.use_stad_adapted_scores and self.use_track_stad:
+                # Only change scores for tracked detections, keep original for untracked
+                final_scores = nms_scores.copy()
+                for i in range(N_nms):
+                    if track_ids[i] >= 0:  # Only for tracked detections
+                        final_scores[i] = np.max(final_probs[i])
+                score_mod_stats['used_stad_scores'] = True
+                score_mod_stats['stad_scores_applied'] = sum(1 for tid in track_ids if tid >= 0)
+            else:
+                final_scores = nms_scores  # No modulation, keep original VLM scores
         
         dbg['score_mod'] = score_mod_stats
         
@@ -1162,6 +1235,9 @@ class GlobalInstanceAdapter(BaseAdapter):
             if new_label != nms_labels[i]:
                 label_changes += 1
         dbg['label_changes'] = label_changes
+
+        dbg['final_score_min'] = float(final_scores.min()) if N_nms > 0 else 0.0
+        dbg['final_score_max'] = float(final_scores.max()) if N_nms > 0 else 0.0
         
         # Create result
         result = self._create_result(
@@ -1200,7 +1276,7 @@ class GlobalInstanceAdapter(BaseAdapter):
                 save_tracking_debug_image(
                     image=image,
                     boxes=nms_boxes,
-                    scores=nms_scores,
+                    scores=final_scores,
                     labels=final_labels,
                     track_ids=track_ids,
                     frame_idx=self.frame_count,
@@ -1258,6 +1334,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         # Score distribution
         if 'score_min' in dbg and 'score_max' in dbg:
             print(f"       Scores: min={dbg['score_min']:.3f}, max={dbg['score_max']:.3f}, "
+                  f"final_min={dbg['final_score_min']:.3f}, final_max={dbg['final_score_max']:.3f}, "
                   f">=tau1({self.cache_config.tau1}): {dbg['cache_high_conf_count']}")
         
         # Global cache
@@ -1295,6 +1372,34 @@ class GlobalInstanceAdapter(BaseAdapter):
             print(f"  📈 STAD: updates={dbg['stad_updates']}, skipped_no_track={dbg['stad_skipped_no_track']} "
                   f"(need score≥{self.stad_config.min_confidence})")
             print(f"       Total STAD updates so far: {self._total_stad_updates}")
+            print(f"       STAD class changes this frame: {dbg.get('stad_class_changes', 0)}")
+            
+            # Collect detailed STAD statistics from confirmed tracks
+            if self.track_manager is not None:
+                confirmed_tracks = self.track_manager.get_confirmed_tracks()
+                if len(confirmed_tracks) > 0:
+                    stad_stats = self._collect_stad_stats(confirmed_tracks)
+                    if stad_stats:
+                        print(f"       === Per-Track STAD Stats (from {len(confirmed_tracks)} confirmed tracks) ===")
+                        # vMF-specific: gamma
+                        if 'gamma_min' in stad_stats:
+                            print(f"       gamma: min={stad_stats['gamma_min']:.2f}, max={stad_stats['gamma_max']:.2f}, "
+                                  f"mean={stad_stats['gamma_mean']:.2f}")
+                        # Gaussian-specific: mu norm and P trace
+                        if 'mu_norm_mean' in stad_stats:
+                            print(f"       mu_norm: mean={stad_stats['mu_norm_mean']:.4f}")
+                        if 'P_trace_mean' in stad_stats:
+                            print(f"       P_trace: mean={stad_stats['P_trace_mean']:.4f}")
+                        # Common: pi entropy
+                        if 'pi_entropy_min' in stad_stats:
+                            print(f"       pi entropy: min={stad_stats['pi_entropy_min']:.3f}, "
+                                  f"max={stad_stats['pi_entropy_max']:.3f}")
+                        if 'avg_updates' in stad_stats:
+                            print(f"       avg STAD updates/track: {stad_stats['avg_updates']:.1f}")
+                        if stad_stats.get('class_distribution'):
+                            class_dist_str = ', '.join([f"{k}:{v}" for k, v in stad_stats['class_distribution'].items()])
+                            print(f"       class distribution (by π argmax): {class_dist_str}")
+            
             if dbg['stad_updates'] == 0 and dbg['n_matches'] > 0:
                 print(f"       ⚠️  Matched {dbg['n_matches']} tracks but 0 STAD updates!")
         else:
@@ -1313,7 +1418,11 @@ class GlobalInstanceAdapter(BaseAdapter):
             if sm.get('boosted', 0) == 0 and dbg['n_matches'] > 0:
                 print(f"       ⚠️  {dbg['n_matches']} matches but 0 boosted! Are tracks confirmed?")
         elif self.use_tracking:
-            print(f"  📊 Score Mod: DISABLED (auto-disabled when TTA active, or use force_score_modulation=True)")
+            sm = dbg.get('score_mod', {})
+            if sm.get('used_stad_scores'):
+                print(f"  📊 Score Mod: DISABLED, using STAD scores for {sm.get('stad_scores_applied', 0)} tracked detections only")
+            else:
+                print(f"  📊 Score Mod: DISABLED (auto-disabled when TTA active, use force_score_modulation=True to override)")
         
         # Pre-filtering stats
         if dbg.get('n_pre_filtered', 0) > 0:
@@ -1421,8 +1530,16 @@ class GlobalInstanceAdapter(BaseAdapter):
         else:  # 'entropy_weighted' (default)
             # Entropy-weighted fusion of all three sources
             H_init = -np.sum(p_init * np.log(p_init + eps))
-            H_global = -np.sum(p_global * np.log(p_global + eps))
-            H_track = -np.sum(p_track * np.log(p_track + eps))
+            if self.use_global_cache:
+                H_global = -np.sum(p_global * np.log(p_global + eps))
+            else:
+                p_global = np.zeros_like(p_global)
+                H_global = 1e10
+            if self.use_track_stad or self.use_tracking:
+                H_track = -np.sum(p_track * np.log(p_track + eps))
+            else:
+                p_track = np.zeros_like(p_track)
+                H_track = 1e10
             
             w_init = np.exp(-H_init)
             w_global = np.exp(-H_global)
@@ -1431,6 +1548,112 @@ class GlobalInstanceAdapter(BaseAdapter):
             total = w_init + w_global + w_track + eps
             fused = (w_init * p_init + w_global * p_global + w_track * p_track) / total
             return fused / (fused.sum() + eps)
+    
+    def _collect_stad_stats(self, tracks: List['Track']) -> Optional[Dict[str, Any]]:
+        """
+        Collect detailed STAD statistics from confirmed tracks for debugging.
+        
+        Monitors key indicators:
+        - gamma: Per-class concentration (vMF only, should be stable)
+        - pi entropy: Class belief uncertainty (lower = more confident)
+        - Class distribution: To detect single-class domination
+        
+        Returns:
+            Dictionary with STAD statistics or None if no valid STAD tracks
+        """
+        if len(tracks) == 0:
+            return None
+        
+        # Collect stats from tracks with active STAD
+        gammas = []
+        pi_entropies = []
+        class_beliefs = []
+        update_counts = []
+        
+        # Gaussian-specific stats
+        mu_norms = []
+        P_traces = []
+        
+        for track in tracks:
+            if track.class_stad is None:
+                continue
+            
+            stad = track.class_stad
+            
+            # Gamma (vMF only)
+            if hasattr(stad, 'gamma') and stad.gamma is not None:
+                gammas.append(stad.gamma.copy())
+            
+            # Gaussian-specific: mu norms and P traces
+            if hasattr(stad, 'mu') and stad.mu is not None:
+                mu_norm = np.linalg.norm(stad.mu, axis=1).mean()
+                mu_norms.append(mu_norm)
+            if hasattr(stad, 'P') and stad.P is not None:
+                if stad.P.ndim == 2:  # Diagonal: (K, D)
+                    P_trace = np.mean(stad.P)
+                else:  # Full: (K, D, D)
+                    P_trace = np.mean([np.trace(stad.P[k]) for k in range(stad.P.shape[0])])
+                P_traces.append(P_trace)
+            
+            # Pi entropy
+            if hasattr(stad, 'pi') and stad.pi is not None:
+                pi = stad.pi
+                entropy = -np.sum(pi * np.log(pi + 1e-10))
+                pi_entropies.append(entropy)
+                class_beliefs.append(pi.copy())
+            
+            # Update count
+            if hasattr(stad, 'num_updates_total'):
+                update_counts.append(stad.num_updates_total)
+        
+        if len(class_beliefs) == 0:
+            return None
+        
+        # Compute aggregate statistics
+        stats = {}
+        
+        # Gamma stats (vMF only)
+        if len(gammas) > 0:
+            all_gammas = np.array(gammas)
+            stats['gamma_min'] = float(all_gammas.min())
+            stats['gamma_max'] = float(all_gammas.max())
+            stats['gamma_mean'] = float(all_gammas.mean())
+            
+            # Warn if gamma is exploding
+            if all_gammas.max() > 100:
+                stats['gamma_warning'] = f"HIGH gamma detected: max={all_gammas.max():.1f}"
+        
+        # Gaussian stats (mu norms and P traces)
+        if len(mu_norms) > 0:
+            stats['mu_norm_mean'] = float(np.mean(mu_norms))
+        if len(P_traces) > 0:
+            stats['P_trace_mean'] = float(np.mean(P_traces))
+        
+        # Pi entropy stats
+        if len(pi_entropies) > 0:
+            stats['pi_entropy_min'] = float(np.min(pi_entropies))
+            stats['pi_entropy_max'] = float(np.max(pi_entropies))
+            stats['pi_entropy_mean'] = float(np.mean(pi_entropies))
+            
+            # Warn if entropy is very low (pi collapsed to single class)
+            if np.min(pi_entropies) < 0.1:
+                stats['pi_warning'] = f"LOW entropy (class collapse?): min={np.min(pi_entropies):.3f}"
+        
+        # Class distribution (most common class by pi argmax)
+        if len(class_beliefs) > 0:
+            class_counts = {}
+            for pi in class_beliefs:
+                top_class = int(np.argmax(pi))
+                class_name = self.target_classes[top_class] if top_class < len(self.target_classes) else f"cls{top_class}"
+                class_counts[class_name] = class_counts.get(class_name, 0) + 1
+            stats['class_distribution'] = class_counts
+        
+        # Average updates per track
+        if len(update_counts) > 0:
+            stats['avg_updates'] = float(np.mean(update_counts))
+            stats['total_updates'] = int(np.sum(update_counts))
+        
+        return stats
     
     def _apply_nms(self, boxes: np.ndarray, scores: np.ndarray,
                    keep_mask: np.ndarray) -> np.ndarray:

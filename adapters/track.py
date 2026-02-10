@@ -895,14 +895,23 @@ class TrackSTADvMF:
             # Optionally combine with VLM probs (matching temporal_ssm_v2.py)
             if self.config.vlm_prior_weight > 0:
                 # λ = normalize(λ_vlm^η · λ_ssm^(1-η))
-                log_combined = (self.config.vlm_prior_weight * np.log(vlm_probs + 1e-10) +
-                               (1 - self.config.vlm_prior_weight) * np.log(ssm_probs + 1e-10))
+                # use entropy to weight the vlm and ssm probs
+                w_vlm = np.exp(-entropy(vlm_probs, axis=1))
+                w_ssm = np.exp(-entropy(ssm_probs, axis=1))
+                w_total = w_vlm + w_ssm + 1e-10
+                w_vlm = w_vlm / w_total
+                w_ssm = w_ssm / w_total
+                w_vlm = w_vlm[:, np.newaxis]
+                w_ssm = w_ssm[:, np.newaxis]
+                log_combined = (w_vlm * np.log(vlm_probs + 1e-10) +
+                               w_ssm * np.log(ssm_probs + 1e-10))
                 responsibilities = safe_softmax(log_combined, axis=1)
             else:
                 responsibilities = ssm_probs
             
             # Apply temporal weights to responsibilities
             weighted_resp = responsibilities * weights[:, np.newaxis]  # (N, K)
+            
             
             # ===== M-STEP: Update parameters =====
             
@@ -915,6 +924,7 @@ class TrackSTADvMF:
             
             # Check per-class update threshold
             class_has_enough = R_k_capped >= self.config.min_updates_per_class
+            
             
             # Update prototypes for classes with enough samples
             new_rho = self.rho.copy()
@@ -953,7 +963,7 @@ class TrackSTADvMF:
                     # STABILITY FIX: EMA gamma update for smoother adaptation
                     new_gamma[k] = (self.config.gamma_ema_decay * gamma_prev[k] +
                                    (1 - self.config.gamma_ema_decay) * gamma_k_from_r)
-                    
+
                     # Clamp gamma
                     new_gamma[k] = np.clip(new_gamma[k], self.config.gamma_min, self.config.gamma_max)
                     
@@ -1069,6 +1079,11 @@ class TrackSTADGaussian:
     This is the FULL implementation of STAD-Gaussian, with the SAME algorithm
     as TemporalSSMGaussian in temporal_ssm_v2.py, adapted for per-track operation.
     
+    FIXED: Now uses proper windowed EM like TrackSTADvMF:
+    - Maintains feature_history, probs_history, confidence_history
+    - E-step: Computes SSM predictions using learned mu, combines with VLM
+    - M-step: Uses soft responsibilities for weighted Kalman updates
+    
     Uses Kalman filter updates instead of vMF EM:
     - Per-class mean μ_k and covariance P_k
     - Predict: P_pred = P_prev + Q (process noise)
@@ -1112,7 +1127,12 @@ class TrackSTADGaussian:
         self.pi = initial_probs.copy().astype(np.float64)
         self.pi = self.pi / (self.pi.sum() + 1e-10)
         
-        # History for smoothing
+        # === History Buffers (windowed EM) - MATCHING TrackSTADvMF ===
+        self.feature_history: List[np.ndarray] = []  # List of (D,) features
+        self.probs_history: List[np.ndarray] = []    # List of (K,) VLM probs
+        self.confidence_history: List[float] = []    # List of confidence scores
+        
+        # History for RTS smoothing (separate from EM history)
         self.mu_pred_history: List[np.ndarray] = []
         self.P_pred_history: List[np.ndarray] = []
         self.mu_filt_history: List[np.ndarray] = []
@@ -1124,6 +1144,12 @@ class TrackSTADGaussian:
         self.num_updates_by_class: np.ndarray = np.zeros(num_classes, dtype=np.int64)
         self.class_update_counts: np.ndarray = np.zeros(num_classes, dtype=np.int32)
     
+    def _get_class_name(self, k: int) -> str:
+        """Get class name for logging."""
+        if self.class_names and k < len(self.class_names):
+            return self.class_names[k]
+        return f"cls{k}"
+    
     def predict(self, features: np.ndarray) -> np.ndarray:
         """
         Predict class probabilities using Gaussian mixture likelihood.
@@ -1131,6 +1157,12 @@ class TrackSTADGaussian:
         p(k|h) ∝ π_k · N(h | μ_k, Σ^ems)
         
         For efficiency, uses diagonal Σ^ems = R_base · I.
+        
+        Args:
+            features: (D,) or (N, D) query features
+            
+        Returns:
+            (K,) or (N, K) class probabilities
         """
         single_input = features.ndim == 1
         if single_input:
@@ -1141,14 +1173,17 @@ class TrackSTADGaussian:
         K = self.num_classes
         
         # Compute log-likelihoods under each Gaussian
+        # log p(h|k) = -0.5 * ||h - μ_k||² / R_base + const
         log_probs = np.zeros((N, K))
         for k in range(K):
             diff = features_norm - self.mu[k]  # (N, D)
             sq_dist = np.sum(diff ** 2, axis=1)  # (N,)
+            # Add temperature scaling for consistency with vMF
             if self.config.use_pi:
-                log_probs[:, k] = -0.5 * sq_dist / self.R_base + np.log(self.pi[k] + 1e-10)
+                log_probs[:, k] = (-0.5 * sq_dist / (self.R_base * self.config.temperature) +
+                                   np.log(self.pi[k] + 1e-10))
             else:
-                log_probs[:, k] = -0.5 * sq_dist / self.R_base
+                log_probs[:, k] = -0.5 * sq_dist / (self.R_base * self.config.temperature)
         
         probs = safe_softmax(log_probs, axis=1)
         
@@ -1157,7 +1192,15 @@ class TrackSTADGaussian:
         return probs
     
     def get_class_belief(self) -> np.ndarray:
-        """Get current class belief (π)."""
+        """
+        Get track's current class belief (mixing coefficients π).
+        
+        This is the main output for fusion with detection predictions.
+        At track level, π represents the accumulated class evidence for THIS object.
+        
+        Returns:
+            (K,) class probabilities
+        """
         return self.pi.copy()
     
     def update(self,
@@ -1165,80 +1208,177 @@ class TrackSTADGaussian:
                vlm_probs: np.ndarray,
                confidence: float) -> None:
         """
-        Update using Kalman filter (FULL implementation from temporal_ssm_v2.py).
+        Update track state with new matched detection using windowed EM.
+        
+        CRITICAL: Use raw VLM probs, NOT post-fusion probs to avoid self-reinforcement!
+        
+        This now implements the SAME windowed EM pattern as TrackSTADvMF,
+        with Kalman filter M-step instead of vMF M-step.
+        
+        Args:
+            feature: (D,) detection feature
+            vlm_probs: (K,) raw VLM class probabilities (NOT post-adaptation!)
+            confidence: Detection confidence score
         """
+        # Skip low-confidence updates
         if confidence < self.config.min_confidence:
             self.num_updates_skipped += 1
             return
         
-        feature_norm = safe_normalize(feature)
+        # Add to history (store normalized feature and raw VLM probs)
+        self.feature_history.append(safe_normalize(feature.copy()))
+        self.probs_history.append(vlm_probs.copy())
+        self.confidence_history.append(confidence)
+        
+        # Keep only last window_size entries
+        while len(self.feature_history) > self.config.window_size:
+            self.feature_history.pop(0)
+            self.probs_history.pop(0)
+            self.confidence_history.pop(0)
+        
+        # Run soft EM on window (FIXED: now uses proper E-step with SSM predictions)
+        self._soft_em_update()
+        
+        self.num_updates_total += 1
+    
+    def _soft_em_update(self) -> None:
+        """
+        Run soft EM on windowed history - FIXED to match TrackSTADvMF pattern.
+        
+        Key fix: E-step now uses SSM predictions (via predict()) combined with VLM probs,
+        instead of just using VLM probs directly as responsibilities.
+        
+        This ensures the learned μ actually influences which classes get updated.
+        """
+        if len(self.feature_history) < 1:
+            return
+        
+        # Concatenate history
+        features = np.array(self.feature_history)  # (T, D)
+        vlm_probs = np.array(self.probs_history)   # (T, K)
+        confs = np.array(self.confidence_history)  # (T,)
+        
+        n_frames = len(features)
+        N = n_frames
         K = self.num_classes
         D = self.feature_dim
         
-        # Get responsibilities from VLM probs
-        responsibilities = vlm_probs.copy()
-        responsibilities = responsibilities / (responsibilities.sum() + 1e-10)
+        # Compute temporal + confidence weights (matching vMF)
+        temporal_weights = np.linspace(0.5, 1.0, n_frames)
+        weights = temporal_weights * confs
+        weights = weights / (weights.sum() + 1e-10)
         
-        # Store predictions for smoothing
-        if self.config.use_smoothing:
-            self.mu_pred_history.append(self.mu.copy())
-            self.P_pred_history.append(self.P.copy())
+        # Normalize features
+        features_norm = safe_normalize(features, axis=1)
         
-        # Per-class Kalman updates (matching temporal_ssm_v2.py)
-        R_k = responsibilities  # Single observation, so R_k = responsibilities
+        # Store previous state for potential smoothing
+        mu_prev = self.mu.copy()
+        P_prev = self.P.copy()
         
-        for k in range(K):
-            if R_k[k] < self.config.min_updates_per_class:
-                continue
+        # EM iterations
+        for em_iter in range(self.config.em_iterations):
+            # ===== E-STEP: Compute soft responsibilities =====
+            # FIXED: Use SSM predictions, not just VLM probs!
             
-            # === Kalman Predict ===
-            # μ_pred = μ_prev (identity transition)
-            # P_pred = P_prev + Q
-            if self.config.use_diagonal_cov:
-                P_pred = self.P[k] + self.Q
+            # Get SSM predictions using learned μ
+            ssm_probs = self.predict(features_norm)  # (N, K)
+            
+            # Combine SSM + VLM using entropy weighting (matching vMF)
+            if self.config.vlm_prior_weight > 0:
+                # Compute entropies
+                eps = 1e-10
+                H_vlm = -np.sum(vlm_probs * np.log(vlm_probs + eps), axis=1)  # (N,)
+                H_ssm = -np.sum(ssm_probs * np.log(ssm_probs + eps), axis=1)  # (N,)
+                
+                # Entropy-based weights (lower entropy = more confident = higher weight)
+                w_vlm = np.exp(-H_vlm)
+                w_ssm = np.exp(-H_ssm)
+                w_total = w_vlm + w_ssm + eps
+                w_vlm = (w_vlm / w_total)[:, np.newaxis]
+                w_ssm = (w_ssm / w_total)[:, np.newaxis]
+                
+                # Combine in log space
+                log_combined = (w_vlm * np.log(vlm_probs + eps) +
+                               w_ssm * np.log(ssm_probs + eps))
+                responsibilities = safe_softmax(log_combined, axis=1)
             else:
-                P_pred = self.P[k] + self.Q
+                responsibilities = ssm_probs
             
-            # === Observation ===
-            y_k = feature_norm  # Single observation
-            R_obs = self.R_base / (confidence + 1e-10)  # Scale by confidence
+            # Apply temporal weights to responsibilities
+            weighted_resp = responsibilities * weights[:, np.newaxis]  # (N, K)
             
-            # === Kalman Update ===
-            if self.config.use_diagonal_cov:
-                # Diagonal Kalman gain: K = P_pred / (P_pred + R_obs)
-                K_gain = P_pred / (P_pred + R_obs + 1e-10)
-                
-                # Update with responsibility weighting
-                innovation = y_k - self.mu[k]
-                self.mu[k] = self.mu[k] + K_gain * innovation * R_k[k]
-                self.P[k] = (1 - K_gain * R_k[k]) * P_pred
-                
-                # Clamp covariance
-                self.P[k] = np.clip(self.P[k], 1e-6, 1.0)
-            else:
-                # Full covariance (expensive)
-                S = P_pred + np.eye(D) * R_obs
-                K_gain = P_pred @ np.linalg.inv(S + np.eye(D) * 1e-10)
-                
-                innovation = y_k - self.mu[k]
-                self.mu[k] = self.mu[k] + K_gain @ innovation * R_k[k]
-                self.P[k] = (np.eye(D) - K_gain * R_k[k]) @ P_pred
+            # ===== M-STEP: Kalman updates per class =====
             
-            self.class_update_counts[k] += 1
-            self.num_updates_by_class[k] += 1
+            # Count effective samples per class
+            R_k = np.sum(weighted_resp, axis=0)  # (K,)
+            
+            # Cap per-class R_k to prevent single-class domination
+            max_Rk_per_class = N * self.config.max_rk_fraction
+            R_k_capped = np.minimum(R_k, max_Rk_per_class)
+            
+            # Check per-class update threshold
+            class_has_enough = R_k_capped >= self.config.min_updates_per_class
+            
+            # Per-class Kalman updates
+            for k in range(K):
+                if not class_has_enough[k]:
+                    continue
+                
+                # === Kalman Predict ===
+                if self.config.use_diagonal_cov:
+                    P_pred = self.P[k] + self.Q
+                else:
+                    P_pred = self.P[k] + self.Q
+                
+                # === Compute class observation (weighted mean of features) ===
+                resp_scale = R_k_capped[k] / (R_k[k] + 1e-10) if R_k[k] > max_Rk_per_class else 1.0
+                y_k = np.sum(weighted_resp[:, k:k+1] * resp_scale * features_norm, axis=0) / (R_k_capped[k] + 1e-10)
+                
+                # Observation noise shrinks with more evidence
+                R_obs = self.R_base / (R_k_capped[k] + 1e-10)
+                
+                # === Kalman Update ===
+                if self.config.use_diagonal_cov:
+                    # Diagonal Kalman gain: K = P_pred / (P_pred + R_obs)
+                    K_gain = P_pred / (P_pred + R_obs + 1e-10)
+                    
+                    # Update mean
+                    innovation = y_k - self.mu[k]
+                    self.mu[k] = self.mu[k] + K_gain * innovation
+                    
+                    # Update covariance
+                    self.P[k] = (1 - K_gain) * P_pred
+                    
+                    # Clamp covariance
+                    self.P[k] = np.clip(self.P[k], 1e-6, 1.0)
+                else:
+                    # Full covariance (expensive)
+                    S = P_pred + np.eye(D) * R_obs
+                    K_gain = P_pred @ np.linalg.inv(S + np.eye(D) * 1e-10)
+                    
+                    innovation = y_k - self.mu[k]
+                    self.mu[k] = self.mu[k] + K_gain @ innovation
+                    self.P[k] = (np.eye(D) - K_gain) @ P_pred
+                
+                self.class_update_counts[k] += 1
+                self.num_updates_by_class[k] += 1
+            
+            # Normalize means (keep on unit sphere for consistency)
+            self.mu = safe_normalize(self.mu, axis=1)
+            
+            # Update mixing coefficients π with Dirichlet prior
+            new_pi = (R_k_capped + self.config.dirichlet_alpha) / (
+                np.sum(R_k_capped) + K * self.config.dirichlet_alpha
+            )
+            
+            # EMA update for π (smoother adaptation)
+            self.pi = 0.9 * self.pi + 0.1 * new_pi
+            self.pi = self.pi / (np.sum(self.pi) + 1e-10)
         
-        # Normalize means (keep on unit sphere for consistency)
-        self.mu = safe_normalize(self.mu, axis=1)
-        
-        # Update mixing coefficients π
-        new_pi = (R_k + self.config.dirichlet_alpha) / (
-            np.sum(R_k) + K * self.config.dirichlet_alpha
-        )
-        self.pi = 0.9 * self.pi + 0.1 * new_pi
-        self.pi = self.pi / (np.sum(self.pi) + 1e-10)
-        
-        # Store filtered states and apply smoothing
+        # Optional RTS smoothing
         if self.config.use_smoothing:
+            self.mu_pred_history.append(mu_prev)
+            self.P_pred_history.append(P_prev)
             self.mu_filt_history.append(self.mu.copy())
             self.P_filt_history.append(self.P.copy())
             
@@ -1252,8 +1392,6 @@ class TrackSTADGaussian:
             # Apply RTS smoothing
             if len(self.mu_filt_history) >= 2:
                 self._rts_smooth()
-        
-        self.num_updates_total += 1
     
     def _rts_smooth(self) -> None:
         """Apply Rauch-Tung-Striebel backward smoothing."""
@@ -1327,7 +1465,8 @@ class TrackSTADGaussian:
             'top_class': int(top_class),
             'top_class_prob': float(self.pi[top_class]),
             'num_updates': self.num_updates_total,
-            'P_mean': float(np.mean(self.P)) if self.config.use_diagonal_cov else float(np.trace(self.P.mean(axis=0)))
+            'P_mean': float(np.mean(self.P)) if self.config.use_diagonal_cov else float(np.trace(self.P.mean(axis=0))),
+            'history_len': len(self.feature_history)
         }
 
 

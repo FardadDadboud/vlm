@@ -1,0 +1,86 @@
+{
+  "description": "INSTANCE ONLY with BEST Gaussian params from grid search (exp_id=48)",
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "output_dir": "./shift_instance_gaussian_best_results",
+  "filters": {
+    "weather": ["clear"],
+    "time": ["daytime"],
+    "max_frames_per_video": null
+  },
+  "max_samples": null,
+  "num_visualizations": 1000,
+  "detector": {
+    "name": "grounding-dino",
+    "model_path": "IDEA-Research/grounding-dino-base",
+    "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
+    "threshold": 0.1,
+    "iou_threshold": 0.7
+  },
+  "adaptation": {
+    "type": "global_instance",
+    "params": {
+      "mode": "instance_only",
+      "output_dir": "./shift_instance_gaussian_best_results",
+      
+      "use_global_cache": false,
+      "use_tracking": true,
+      "use_track_stad": true,
+      
+      "_comment1": "=== Tracking (same as tracking_only) ===",
+      "min_hits_to_confirm": 3,
+      "max_age": 10,
+      "feature_alpha": 0.1,
+      "association_method": "bytetrack",
+      "iou_threshold": 0.5,
+      "high_score_threshold": 0.9,
+      "low_score_threshold": 0.8,
+      "track_creation_threshold": 0.7,
+      "max_tracks": 100,
+      "aggressive_prefilter": false,
+      
+      "_comment2": "=== BEST Gaussian params from grid search (exp_id=48) ===",
+      "ssm_type": "gaussian",
+      "q_scale": 0.01,
+      "r_base": 0.1,
+      "use_diagonal_cov": true,
+      "use_smoothing": false,
+      
+      "window_size": 5,
+      "tau_update": 0.5,
+      "min_updates_per_class": 0.5,
+      
+      "temperature": 0.1,
+      
+      "use_pi": true,
+      "dirichlet_alpha": 0.1,
+      
+      "_comment3": "=== Fusion ===",
+      "fusion_mode": "entropy_weighted",
+      "fusion_init_weight": 0.3,
+      "fusion_global_weight": 0.0,
+      "fusion_track_weight": 0.7,
+      
+      "_comment4": "=== CRITICAL: DO NOT use STAD scores (they hurt mAP!) ===",
+      "use_stad_adapted_scores": false,
+      
+      "_comment5": "=== Score modulation (force enabled = tracking boosts mAP) ===",
+      "use_track_score_modulation": true,
+      "force_score_modulation": true,
+      "confirmed_track_boost": 0.1,
+      "tentative_track_penalty": 0.0,
+      "untracked_penalty": 0.05,
+      
+      "use_temporal_score_smoothing": true,
+      "score_smoothing_alpha": 0.3,
+      "score_smoothing_window": 5,
+      
+      "nms_threshold": 0.7,
+      "visual_debug": false,
+      "debug": true,
+      "debug_every": 10
+    }
+  },
+  "reset_on_video_change": true,
+  "process_by_video": true
+}

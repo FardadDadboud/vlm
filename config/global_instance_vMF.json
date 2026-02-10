@@ -1,0 +1,115 @@
+{
+  "description": "FULL TRUST mode with vMF STAD - Global BCA+ + Instance Tracking + Per-Track STAD",
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "output_dir": "./shift_full_vmf_results",
+  "filters": {
+    "weather": ["overcast"],
+    "time": ["daytime"],
+    "max_frames_per_video": null
+  },
+  "max_samples": null,
+  "num_visualizations": 1000,
+  "detector": {
+    "name": "grounding-dino",
+    "model_path": "IDEA-Research/grounding-dino-base",
+    "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
+    "threshold": 0.1,
+    "iou_threshold": 0.7
+  },
+  "adaptation": {
+    "type": "global_instance",
+    "params": {
+      "mode": "full",
+      "output_dir": "./shift_full_vmf_results",
+      
+      "_comment_mode": "=== FULL MODE: Global + Instance ===",
+      "use_global_cache": false,
+      "use_tracking": true,
+      "use_track_stad": true,
+      
+      "_comment_global": "=== Global BCA+ Cache (BEST params from exp_id=238) ===",
+      "tau1": 0.6,
+      "tau2": 0.9,
+      "tau2_init": 0.8,
+      "ws": 0.1,
+      "logit_temperature": 10.0,
+      "alpha": 0.3,
+      "max_cache_size": 25,
+      "use_batch_init": true,
+      "batch_init_size": 10,
+      "use_adapted_probs_for_cache": true,
+      
+      "_comment_lifecycle": "=== Cache Lifecycle DISABLED (matching original BCA+) ===",
+      "min_hits_to_confirm_cache": 1,
+      "max_age_cache": 999999,
+      
+      "_comment_tracking": "=== Tracking (from instance_only config) ===",
+      "min_hits_to_confirm": 3,
+      "max_age": 10,
+      "feature_alpha": 0.1,
+      "association_method": "bytetrack",
+      "iou_threshold": 0.5,
+      "high_score_threshold": 0.9,
+      "low_score_threshold": 0.8,
+      "track_creation_threshold": 0.7,
+      "max_tracks": 100,
+      "association_fast_threshold": 50,
+      "aggressive_prefilter": false,
+      
+      "_comment_vmf": "=== vMF STAD (BEST params from exp_id=706) ===",
+      "ssm_type": "vmf",
+      "kappa_trans": 10.0,
+      "kappa_ems": 10.0,
+      "gamma_init": 10.0,
+      "gamma_min": 1.0,
+      "gamma_max": 200.0,
+      "gamma_ema_decay": 0.7,
+      "kappa_max": 200.0,
+      "kappa_min": 1e-06,
+      
+      "window_size": 10,
+      "em_iterations": 3,
+      "tau_update": 0.6,
+      "min_updates_per_class": 0.5,
+      "max_rk_fraction": 1.0,
+      
+      "temperature": 0.1,
+      "vlm_prior_weight": 0.3,
+      
+      "use_pi": true,
+      "use_ema_pi": false,
+      "dirichlet_alpha": 0.1,
+      
+      "_comment_part53": "=== Part 5.3: Init track STAD from global cache ===",
+      "init_from_cache": true,
+      "cache_match_threshold": 0.5,
+      
+      "_comment_fusion": "=== Part 5.2: 3-Source Fusion ===",
+      "fusion_mode": "entropy_weighted",
+      "fusion_init_weight": 0.1,
+      "fusion_global_weight": 0.3,
+      "fusion_track_weight": 0.6,
+      "fusion_confidence_threshold": 0.7,
+      
+      "_comment_scores": "=== Score Modulation (same as instance_only) ===",
+      "use_stad_adapted_scores": false,
+      "use_track_score_modulation": true,
+      "force_score_modulation": true,
+      "confirmed_track_boost": 0.1,
+      "tentative_track_penalty": 0.0,
+      "untracked_penalty": 0.05,
+      
+      "use_temporal_score_smoothing": true,
+      "score_smoothing_alpha": 0.3,
+      "score_smoothing_window": 5,
+      
+      "nms_threshold": 0.7,
+      "visual_debug": false,
+      "debug": true,
+      "debug_every": 10
+    }
+  },
+  "reset_on_video_change": true,
+  "process_by_video": true
+}

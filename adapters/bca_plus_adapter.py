@@ -233,9 +233,7 @@ class BCAPlusAdapter(BaseAdapter):
         if len(likelihood) == 1:
             return likelihood
         likelihood = likelihood * self.logit_temperature
-        P_U_given_x = self._softmax(likelihood)
-
-        
+        P_U_given_x = self._softmax(likelihood)       
         
         return P_U_given_x
     

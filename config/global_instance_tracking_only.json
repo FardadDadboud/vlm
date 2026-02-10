@@ -31,7 +31,7 @@
       "min_hits_to_confirm": 3,
       "max_age": 20,
       "feature_alpha": 0.1,
-      "association_method": "bytetrack",
+      "association_method": "hungarian",
       "iou_threshold": 0.5,
       "high_score_threshold": 0.9,
       "low_score_threshold": 0.8,
@@ -43,7 +43,7 @@
       "aggressive_prefilter": false,
       
       "_comment_phantom": "=== Phantom Detections (output predicted boxes for missed detections) ===",
-      "use_predicted_for_missed": true,
+      "use_predicted_for_missed": false,
       "predicted_score_decay": 0.9,
       "predicted_min_score": 0.3,
       "predicted_max_frames": 3,
@@ -52,7 +52,7 @@
       "use_track_score_modulation": true,
       "force_score_modulation": false,
       "confirmed_track_boost": 0.1,
-      "tentative_track_penalty": 0.0,
+      "tentative_track_penalty": 0.00,
       "untracked_penalty": 0.05,
       "filter_untracked": false,
       

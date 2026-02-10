@@ -64,8 +64,8 @@ class EnhancedBCAPlusConfig:
     logit_temperature: float = 10.0
     
     # === Lifecycle ===
-    min_hits_to_confirm: int = 3   # Hits needed to confirm entry
-    max_age: int = 30              # Frames before deletion
+    min_hits_to_confirm_cache: int = 1   # Hits needed to confirm entry
+    max_age_cache: int = 999999              # Frames before deletion
     
     # === Initialization ===
     # Batch init uses greedy clustering to seed cache with diverse entries
@@ -274,8 +274,8 @@ class EnhancedBCAPlusCache:
         # Posterior via softmax (row-wise)
         logits = self.config.logit_temperature * S
         posterior = self._safe_softmax(logits, axis=1)  # (N, M)
-        
-        return posterior
+
+
         
         return posterior
     
@@ -321,7 +321,8 @@ class EnhancedBCAPlusCache:
         return adapted / (adapted.sum() + eps)
     
     def adapt_probs_batch(self, features: np.ndarray, boxes: np.ndarray,
-                         class_probs: np.ndarray) -> np.ndarray:
+                         class_probs: np.ndarray,
+                         return_posteriors: bool = False) -> np.ndarray:
         """
         Batch adapt class probabilities for multiple detections.
         
@@ -329,15 +330,19 @@ class EnhancedBCAPlusCache:
             features: (N, D) detection features
             boxes: (N, 4) detection boxes
             class_probs: (N, K) VLM class probabilities
+            return_posteriors: If True, also return the computed posteriors for cache update
             
         Returns:
             (N, K) adapted class probabilities
+            OR tuple of ((N, K) adapted, (N, M) posteriors) if return_posteriors=True
         """
         N = len(features)
         if self.M == 0 or N == 0:
+            if return_posteriors:
+                return class_probs.copy(), None
             return class_probs.copy()
         
-        # Batch posterior: (N, M)
+        # Batch posterior: (N, M) - FROZEN at current M!
         posterior = self.compute_posterior_batch(features, boxes)
         
         # Cache prediction: P(y|cache) = posterior @ V_cache.T -> (N, K)
@@ -355,18 +360,27 @@ class EnhancedBCAPlusCache:
         adapted = (w_vlm * class_probs + w_cache * cache_probs) / (w_vlm + w_cache + eps)
         adapted = adapted / (adapted.sum(axis=1, keepdims=True) + eps)
         
+        if return_posteriors:
+            return adapted, posterior
         return adapted
     
     def update_cache(self, features: np.ndarray, boxes: np.ndarray,
-                    probs: np.ndarray, scores: np.ndarray) -> None:
+                    probs: np.ndarray, scores: np.ndarray,
+                    posteriors: np.ndarray = None) -> None:
         """
         Update cache with new detections.
+        
+        CRITICAL: Original BCA+ uses PRE-COMPUTED posteriors from a FROZEN cache snapshot.
+        If posteriors are provided, they will be used for matching decisions.
+        If not provided, posteriors are recomputed (which may give different results
+        if cache is modified during the update loop - NOT recommended!).
         
         Args:
             features: (N, D) detection features
             boxes: (N, 4) detection boxes
-            probs: (N, K) class probabilities (should be RAW VLM probs!)
+            probs: (N, K) class probabilities
             scores: (N,) confidence scores
+            posteriors: (N, M) PRE-COMPUTED posteriors from adapt_probs_batch (optional but recommended!)
         """
         N = len(features)
         if N == 0:
@@ -399,13 +413,22 @@ class EnhancedBCAPlusCache:
         matched_before = self._debug_entries_matched
         created_before = self._debug_entries_created
         
+        # CRITICAL: Use pre-computed posteriors if provided (matching original BCA+ frozen snapshot!)
+        # The posteriors were computed against cache state at START of frame, before any updates
         for idx in high_conf_idx:
             feature = features[idx]
             box = boxes[idx]
             prob = probs[idx]
             score = scores[idx]
             
-            self._update_single(feature, box, prob, score)
+            # Get posterior for this detection
+            if posteriors is not None and self.M > 0 and posteriors.shape[1] == m_before:
+                # Use PRE-COMPUTED posterior (frozen snapshot - matches original BCA+!)
+                posterior = posteriors[idx]
+                self._update_single_with_posterior(feature, box, prob, score, posterior)
+            else:
+                # Fallback: recompute posterior (not ideal, cache may have changed)
+                self._update_single(feature, box, prob, score)
         
         # Calculate per-frame stats
         matches_this_frame = self._debug_entries_matched - matched_before
@@ -486,6 +509,56 @@ class EnhancedBCAPlusCache:
                 self._update_entry(m_star, feature, box, prob, score)
                 self._debug_entries_matched += 1
     
+    def _update_single_with_posterior(self, feature: np.ndarray, box: np.ndarray,
+                                      prob: np.ndarray, score: float,
+                                      posterior: np.ndarray) -> None:
+        """
+        Update cache with single detection using PRE-COMPUTED posterior.
+        
+        CRITICAL: This matches original BCA+ behavior where posteriors are computed
+        against a FROZEN cache snapshot at the start of each frame.
+        
+        Args:
+            feature: (D,) detection feature
+            box: (4,) detection box
+            prob: (K,) class probabilities
+            score: confidence score
+            posterior: (M,) PRE-COMPUTED posterior over cache entries
+        """
+        if self.M == 0:
+            # Create first entry
+            self._create_entry(feature, box, prob, score)
+            self._debug_entries_created += 1
+            return
+        
+        # Use PRE-COMPUTED posterior (not recomputed!)
+        m_star = np.argmax(posterior)
+        tau2 = self._get_tau2(m_star)
+        
+        # Debug: track posterior stats for diagnostics
+        self._debug_last_posterior_max = float(posterior[m_star])
+        self._debug_last_tau2 = tau2
+        
+        if posterior[m_star] >= tau2:
+            # Match found - update existing entry
+            self._update_entry(m_star, feature, box, prob, score)
+            self._debug_entries_matched += 1
+        else:
+            # No good match - create new entry
+            if self.M < self.config.max_cache_size:
+                self._create_entry(feature, box, prob, score)
+                self._debug_entries_created += 1
+                
+                # Debug: log why entry was created
+                if self.config.debug:
+                    state_str = 'CONFIRMED' if self.states[m_star] == CacheEntryState.CONFIRMED else 'TENTATIVE'
+                    print(f"      [Cache] NEW entry (frozen): P(m*|x)={posterior[m_star]:.3f} < tau2={tau2:.3f} "
+                          f"(m*={m_star} is {state_str}, M now {self.M})")
+            else:
+                # Cache full - force update best match
+                self._update_entry(m_star, feature, box, prob, score)
+                self._debug_entries_matched += 1
+    
     def _create_entry(self, feature: np.ndarray, box: np.ndarray,
                      prob: np.ndarray, score: float) -> int:
         """Create new cache entry (Eq. 16). Returns entry index."""
@@ -498,11 +571,16 @@ class EnhancedBCAPlusCache:
         h = box[3] - box[1]
         scale = np.array([w / image_w, h / image_h])  # (2,)
         
-        # Expand arrays
-        self.F_cache = np.hstack([self.F_cache, feature_norm.reshape(-1, 1)])
-        self.B_cache = np.hstack([self.B_cache, scale.reshape(2, 1)])  # (2, M+1)
-        self.V_cache = np.hstack([self.V_cache, prob.reshape(-1, 1)])
-        self.C_cache = np.append(self.C_cache, 1)  # Count-based (like original BCA+)
+        if self.F_cache is None:
+            self.F_cache = feature_norm.reshape(-1, 1)
+            self.B_cache = scale.reshape(2, 1)
+            self.V_cache = prob.reshape(-1, 1)
+            self.C_cache = np.array([1])
+        else:
+            self.F_cache = np.hstack([self.F_cache, feature_norm.reshape(-1, 1)])
+            self.B_cache = np.hstack([self.B_cache, scale.reshape(2, 1)])
+            self.V_cache = np.hstack([self.V_cache, prob.reshape(-1, 1)])
+            self.C_cache = np.append(self.C_cache, 1)
         
         # Lifecycle
         self.hits = np.append(self.hits, 1)
@@ -547,7 +625,7 @@ class EnhancedBCAPlusCache:
         
         # State transition
         if (self.states[idx] == CacheEntryState.TENTATIVE and 
-            self.hits[idx] >= self.config.min_hits_to_confirm):
+            self.hits[idx] >= self.config.min_hits_to_confirm_cache):
             self.states[idx] = CacheEntryState.CONFIRMED
     
     def _collect_for_batch_init(self, features: np.ndarray, boxes: np.ndarray,
@@ -647,7 +725,7 @@ class EnhancedBCAPlusCache:
                     if combined_sim > best_sim:
                         best_sim = combined_sim
                         best_cluster_idx = cluster_idx
-                
+
                 # Decide: add to existing cluster or create new one
                 can_add_to_cluster = (best_sim >= TAU2_INIT and 
                                      best_cluster_idx >= 0 and 
@@ -719,11 +797,11 @@ class EnhancedBCAPlusCache:
             return 0
         
         # Mark for deletion
-        delete_mask = self.time_since_update > self.config.max_age
+        delete_mask = self.time_since_update > self.config.max_age_cache
         
         # Also delete tentative entries that are too old
         for i in range(self.M):
-            if self.states[i] == CacheEntryState.TENTATIVE and self.age[i] > self.config.max_age // 2:
+            if self.states[i] == CacheEntryState.TENTATIVE and self.age[i] > self.config.max_age_cache // 2:
                 delete_mask[i] = True
         
         num_deleted = np.sum(delete_mask)
@@ -756,11 +834,16 @@ class EnhancedBCAPlusCache:
     def reset(self) -> None:
         """Reset all state."""
         self.M = 0
-        self.F_cache = np.zeros((self.feature_dim, 0))
-        self.B_cache = np.zeros((2, 0))  # FIXED: 2D array (2, M)
-        self.V_cache = np.zeros((self.num_classes, 0))
-        self.C_cache = np.zeros(0)
-        
+        # self.F_cache = np.zeros((self.feature_dim, 0))
+        # self.B_cache = np.zeros((2, 0))  # FIXED: 2D array (2, M)
+        # self.V_cache = np.zeros((self.num_classes, 0))
+        # self.C_cache = np.zeros(0)
+
+        self.F_cache = None
+        self.B_cache = None
+        self.V_cache = None
+        self.C_cache = None
+
         self.hits = np.zeros(0, dtype=np.int32)
         self.age = np.zeros(0, dtype=np.int32)
         self.time_since_update = np.zeros(0, dtype=np.int32)

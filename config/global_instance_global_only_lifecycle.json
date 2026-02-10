@@ -1,0 +1,59 @@
+{
+  "description": "GLOBAL ONLY mode with BEST BCA+ params from grid search (exp_id=238)",
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "output_dir": "./shift_global_only_results",
+  "filters": {
+    "weather": ["clear"],
+    "time": ["daytime"],
+    "max_frames_per_video": null
+  },
+  "max_samples": null,
+  "num_visualizations": 1000,
+  "detector": {
+    "name": "grounding-dino",
+    "model_path": "IDEA-Research/grounding-dino-base",
+    "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"],
+    "threshold": 0.1,
+    "iou_threshold": 0.7
+  },
+  "adaptation": {
+    "type": "global_instance",
+    "params": {
+      "mode": "global_only",
+      "output_dir": "./shift_global_only_results",
+      
+      "use_global_cache": true,
+      "use_tracking": false,
+      "use_track_stad": false,
+      
+      "_comment1": "=== BEST BCA+ params from grid search (exp_id=238) ===",
+      "tau1": 0.6,
+      "tau2": 0.9,
+      "tau2_init": 0.8,
+      "ws": 0.1,
+      "logit_temperature": 10.0,
+      "alpha": 0.3,
+      "max_cache_size": 25,
+      
+      "_comment2": "=== Lifecycle DISABLED (original BCA+ had no lifecycle) ===",
+      "min_hits_to_confirm": 2,
+      "max_age": 20,
+      
+      "_comment2b": "=== Cache Update: Use ADAPTED probs to match original BCA+ ===",
+      "use_adapted_probs_for_cache": true,
+      
+      "_comment3": "=== Batch Init (matching original BCA+) ===",
+      "use_batch_init": true,
+      "batch_init_size": 10,
+      
+      "_comment4": "=== Other settings ===",
+      "nms_threshold": 0.7,
+      "visual_debug": false,
+      "debug": true,
+      "debug_every": 10
+    }
+  },
+  "reset_on_video_change": true,
+  "process_by_video": true
+}
