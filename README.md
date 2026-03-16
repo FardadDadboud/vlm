@@ -2,4 +2,4 @@ Implementation of the VLM-Based object detectors in the face of domain shift. Te
 
 # *TRUST*: <u>TR</u>AJECTORY-G*U*IDED *S*TATE-SPACE *T*EMPORAL TEST-TIME ADAPTATION #
 
-<u>Underlined text</u>
+This is an <ins>underlined</ins> text.
