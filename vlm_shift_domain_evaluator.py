@@ -147,11 +147,16 @@ class VLMSHIFTDomainEvaluator:
         
         # Process predictions
         print("  Processing predictions...")
+        # PERF-1 FIX: build image_id → sample lookup once (O(N)), not O(N) per prediction
+        if not hasattr(self, '_image_id_to_sample'):
+            self._image_id_to_sample = {
+                s['image_info']['id']: s for s in self.dataset
+            }
         for pred in predictions:
             image_id = pred['image_id']
             
-            # Find domain for this image
-            sample = next((s for s in self.dataset if s['image_info']['id'] == image_id), None)
+            # Find domain for this image — O(1) dict lookup
+            sample = self._image_id_to_sample.get(image_id, None)
             if sample is None:
                 continue
             
@@ -194,7 +199,16 @@ class VLMSHIFTDomainEvaluator:
             "motorcycle": 5,
             "bicycle": 6
         }
-        return category_map.get(label.lower(), 1)
+        cat_id = category_map.get(label.lower().strip(), None)
+        if cat_id is None:
+            if not hasattr(self, '_unknown_label_warnings'):
+                self._unknown_label_warnings = set()
+            if label not in self._unknown_label_warnings:
+                print(f"  WARNING: unknown label '{label}' has no category mapping, "
+                      f"defaulting to pedestrian(1). Check label normalization.")
+                self._unknown_label_warnings.add(label)
+            return 1
+        return cat_id
     
     def _compute_domain_metrics(self) -> Dict[str, Any]:
         """Compute mAP metrics for each domain"""
@@ -242,13 +256,23 @@ class VLMSHIFTDomainEvaluator:
             ]
         }
         
-        # Add annotation IDs
+        # Add annotation IDs — MUST start at 1, not 0.
+        # pycocotools uses 0 as the "unmatched" sentinel in dtMatches/gtMatches,
+        # so any GT annotation with id=0 can never register as a true positive.
         for idx, anno in enumerate(annotations):
             anno_copy = anno.copy()
-            anno_copy['id'] = idx
+            anno_copy['id'] = idx + 1  # 1-indexed to avoid id=0 bug
             # Convert bbox from [x1,y1,x2,y2] to [x,y,w,h] for COCO
             x1, y1, x2, y2 = anno_copy['bbox']
-            anno_copy['bbox'] = [x1, y1, x2-x1, y2-y1]
+            w, h = x2 - x1, y2 - y1
+            # BUG-6 FIX: validate bbox dimensions
+            if w <= 0 or h <= 0:
+                print(f"  WARNING: degenerate bbox id={anno_copy['id']} "
+                      f"[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}] → w={w:.1f},h={h:.1f}, skipping")
+                continue
+            anno_copy['bbox'] = [x1, y1, w, h]
+            # BUG-4 FIX: COCO GT requires explicit 'area' for size-based AP
+            anno_copy['area'] = w * h
             # In _evaluate_single_domain, after anno_copy['bbox'] conversion (around line 251):
             if 'iscrowd' not in anno_copy:
                 anno_copy['iscrowd'] = 0  # IMPORTANT: COCO requires this field
@@ -303,11 +327,128 @@ class VLMSHIFTDomainEvaluator:
                 'num_predictions': len(predictions)
             }
             
+            # ── Per-class metrics extraction ──
+            per_class = self._extract_per_class_metrics(coco, coco_dt, coco_eval, domain_name)
+            metrics['per_class'] = per_class
+            
             return metrics
             
         finally:
             # Clean up temp file
             os.unlink(gt_file)
+
+    def _extract_per_class_metrics(self, coco, coco_dt, coco_eval, domain_name):
+        """
+        Extract per-class AP (mAP, AP@50, AP@75), AR, and TP/FP/FN from COCO eval.
+        
+        coco_eval.eval['precision'] shape: [T, R, K, A, M]
+            T = 10 IoU thresholds (0.50:0.05:0.95)
+            R = 101 recall thresholds (0.00:0.01:1.00)
+            K = number of categories
+            A = 4 area ranges (all, small, medium, large)
+            M = 3 maxDets values (1, 10, 100)
+        
+        coco_eval.eval['recall'] shape: [T, K, A, M]
+        """
+        CATEGORY_NAMES = {1: 'pedestrian', 2: 'car', 3: 'truck',
+                          4: 'bus', 5: 'motorcycle', 6: 'bicycle'}
+        
+        precision = coco_eval.eval['precision']   # [T, R, K, A, M]
+        recall = coco_eval.eval['recall']          # [T, K, A, M]
+        
+        cat_ids = coco_eval.params.catIds
+        area_idx = 0    # 'all'
+        maxdet_idx = 2  # maxDets=100
+        
+        n_imgs = len(coco_eval.params.imgIds)
+        n_cats = len(cat_ids)
+        n_areas = len(coco_eval.params.areaRng)
+        
+        per_class = {}
+        
+        print(f"\n  ── Per-Class Metrics ({domain_name}) ──")
+        print(f"  {'Class':<14s} {'GT':>5s} {'Pred':>6s} {'AP':>7s} {'AP@50':>7s} "
+              f"{'AP@75':>7s} {'AR@100':>7s} {'TP':>5s} {'FP':>6s} {'FN':>5s}")
+        print(f"  {'-'*80}")
+        
+        for k_idx, cat_id in enumerate(cat_ids):
+            cat_name = CATEGORY_NAMES.get(int(cat_id), f'cat_{cat_id}')
+            
+            # ── AP metrics ──
+            # mAP (average over all 10 IoU thresholds)
+            p_all = precision[:, :, k_idx, area_idx, maxdet_idx]
+            valid = p_all[p_all > -1]
+            ap = float(np.mean(valid)) if len(valid) > 0 else -1.0
+            
+            # AP @ IoU=0.50 (index 0)
+            p_50 = precision[0, :, k_idx, area_idx, maxdet_idx]
+            valid_50 = p_50[p_50 > -1]
+            ap_50 = float(np.mean(valid_50)) if len(valid_50) > 0 else -1.0
+            
+            # AP @ IoU=0.75 (index 5)
+            p_75 = precision[5, :, k_idx, area_idx, maxdet_idx]
+            valid_75 = p_75[p_75 > -1]
+            ap_75 = float(np.mean(valid_75)) if len(valid_75) > 0 else -1.0
+            
+            # ── AR @ maxDets=100 (average over IoU thresholds) ──
+            r_vals = recall[:, k_idx, area_idx, maxdet_idx]
+            valid_r = r_vals[r_vals > -1]
+            ar_100 = float(np.mean(valid_r)) if len(valid_r) > 0 else -1.0
+            
+            # ── TP / FP / FN at IoU=0.5 ──
+            tp, fp, fn = 0, 0, 0
+            iou_idx = 0  # IoU=0.5
+            
+            for img_idx in range(n_imgs):
+                eval_idx = k_idx * (n_areas * n_imgs) + area_idx * n_imgs + img_idx
+                evalImg = coco_eval.evalImgs[eval_idx]
+                if evalImg is None:
+                    continue
+                
+                dtMatches = evalImg.get('dtMatches', None)
+                if dtMatches is not None and len(dtMatches) > 0:
+                    matches = dtMatches[iou_idx]
+                    tp += int((matches > 0).sum())
+                    fp += int((matches == 0).sum())
+                
+                gtMatches = evalImg.get('gtMatches', None)
+                if gtMatches is not None and len(gtMatches) > 0:
+                    fn += int((gtMatches[iou_idx] == 0).sum())
+            
+            # ── GT / Pred counts ──
+            n_gt = len(coco.getAnnIds(catIds=[int(cat_id)]))
+            n_dt = len(coco_dt.getAnnIds(catIds=[int(cat_id)]))
+            
+            per_class[cat_name] = {
+                'category_id': int(cat_id),
+                'AP': round(ap, 4),
+                'AP_50': round(ap_50, 4),
+                'AP_75': round(ap_75, 4),
+                'AR_100': round(ar_100, 4),
+                'num_gt': n_gt,
+                'num_predictions': n_dt,
+                'TP': tp,
+                'FP': fp,
+                'FN': fn,
+            }
+            
+            # Precision / Recall at IoU=0.5
+            prec_at_50 = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec_at_50 = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            per_class[cat_name]['precision_at_50'] = round(prec_at_50, 4)
+            per_class[cat_name]['recall_at_50'] = round(rec_at_50, 4)
+            
+            # Print row
+            ap_str = f"{ap:.4f}" if ap >= 0 else "  N/A "
+            ap50_str = f"{ap_50:.4f}" if ap_50 >= 0 else "  N/A "
+            ap75_str = f"{ap_75:.4f}" if ap_75 >= 0 else "  N/A "
+            ar_str = f"{ar_100:.4f}" if ar_100 >= 0 else "  N/A "
+            print(f"  {cat_name:<14s} {n_gt:>5d} {n_dt:>6d} {ap_str:>7s} {ap50_str:>7s} "
+                  f"{ap75_str:>7s} {ar_str:>7s} {tp:>5d} {fp:>6d} {fn:>5d}")
+        
+        print(f"  {'-'*80}")
+        
+        return per_class
 
     def _analyze_score_distribution_by_match(self, coco, coco_dt, coco_eval, domain_name):
         """Analyze score distribution for TPs vs FPs to find optimal threshold"""
@@ -348,23 +489,36 @@ class VLMSHIFTDomainEvaluator:
         print(f"\n  === SCORE DISTRIBUTION ANALYSIS ===")
         print(f"  True Positive scores:")
         print(f"    Count: {len(tp_scores)}")
-        print(f"    Mean: {tp_scores.mean():.4f}, Median: {np.median(tp_scores):.4f}")
-        print(f"    Min: {tp_scores.min():.4f}, Max: {tp_scores.max():.4f}")
-        print(f"    Percentiles [25, 50, 75, 90]: {np.percentile(tp_scores, [25, 50, 75, 90])}")
+        # BUG-3 FIX: guard empty arrays before calling .mean()/.min()
+        if len(tp_scores) > 0:
+            print(f"    Mean: {tp_scores.mean():.4f}, Median: {np.median(tp_scores):.4f}")
+            print(f"    Min: {tp_scores.min():.4f}, Max: {tp_scores.max():.4f}")
+            print(f"    Percentiles [25, 50, 75, 90]: {np.percentile(tp_scores, [25, 50, 75, 90])}")
+        else:
+            print(f"    (no true positives in this domain)")
         
         print(f"\n  False Positive scores:")
         print(f"    Count: {len(fp_scores)}")
-        print(f"    Mean: {fp_scores.mean():.4f}, Median: {np.median(fp_scores):.4f}")
-        print(f"    Min: {fp_scores.min():.4f}, Max: {fp_scores.max():.4f}")
-        print(f"    Percentiles [25, 50, 75, 90]: {np.percentile(fp_scores, [25, 50, 75, 90])}")
+        if len(fp_scores) > 0:
+            print(f"    Mean: {fp_scores.mean():.4f}, Median: {np.median(fp_scores):.4f}")
+            print(f"    Min: {fp_scores.min():.4f}, Max: {fp_scores.max():.4f}")
+            print(f"    Percentiles [25, 50, 75, 90]: {np.percentile(fp_scores, [25, 50, 75, 90])}")
+        else:
+            print(f"    (no false positives in this domain)")
         
         # Find optimal threshold using F1
         print(f"\n  === THRESHOLD ANALYSIS ===")
-        print(f"  {'Threshold':>10s} {'Precision':>10s} {'Recall':>10s} {'F1':>10s} {'TP':>8s} {'FP':>8s}")
-        print(f"  {'-'*58}")
         
         best_f1 = 0
         best_threshold = 0
+        
+        if len(tp_scores) == 0 and len(fp_scores) == 0:
+            print(f"  (no detections to analyze)")
+            print(f"  === END SCORE ANALYSIS ===\n")
+            return best_threshold
+        
+        print(f"  {'Threshold':>10s} {'Precision':>10s} {'Recall':>10s} {'F1':>10s} {'TP':>8s} {'FP':>8s}")
+        print(f"  {'-'*58}")
         
         for thresh in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
             tp = (tp_scores >= thresh).sum()
@@ -768,7 +922,7 @@ class VLMSHIFTDomainEvaluator:
             image_id = pred['image_id']
             
             # Find sample
-            sample = next((s for s in self.dataset if s['image_info']['id'] == image_id), None)
+            sample = self._image_id_to_sample.get(image_id, None)
             if sample is None:
                 continue
             
@@ -816,7 +970,7 @@ class VLMSHIFTDomainEvaluator:
         print(f"  ✓ Saved {sum(domain_vis_counts.values())} visualization images to {vis_dir}")
     
     def _save_comprehensive_results(self, results: Dict[str, Any]):
-        """Save detailed results to JSON"""
+        """Save detailed results to JSON and human-readable summary"""
         
         # Main results file
         results_file = self.output_dir / "domain_evaluation_results.json"
@@ -826,9 +980,9 @@ class VLMSHIFTDomainEvaluator:
         # Create summary report
         summary_file = self.output_dir / "evaluation_summary.txt"
         with open(summary_file, 'w') as f:
-            f.write("="*80 + "\n")
+            f.write("="*100 + "\n")
             f.write("SHIFT Domain Evaluation Summary\n")
-            f.write("="*80 + "\n\n")
+            f.write("="*100 + "\n\n")
             
             # Overall metrics
             if 'overall' in results:
@@ -839,14 +993,20 @@ class VLMSHIFTDomainEvaluator:
                 f.write(f"  mAP (small):        {results['overall']['mAP_small']:.4f}\n")
                 f.write(f"  mAP (medium):       {results['overall']['mAP_medium']:.4f}\n")
                 f.write(f"  mAP (large):        {results['overall']['mAP_large']:.4f}\n\n")
+                
+                # Overall per-class table
+                if 'per_class' in results['overall']:
+                    f.write("Overall Per-Class Performance:\n")
+                    self._write_per_class_table(f, results['overall']['per_class'])
+                    f.write("\n")
             
             # Per-domain metrics
-            f.write("Per-Domain Performance:\n")
+            f.write("\nPer-Domain Performance:\n")
             f.write(f"{'Domain':<30s} {'mAP':>8s} {'mAP@50':>8s} {'Images':>8s} {'GT':>8s} {'Pred':>8s}\n")
             f.write("-"*80 + "\n")
             
             for domain in sorted(results.keys()):
-                if domain == 'overall' or domain == 'size_analysis':
+                if domain in ('overall', 'size_analysis'):
                     continue
                 metrics = results[domain]
                 f.write(f"{domain:<30s} "
@@ -855,6 +1015,21 @@ class VLMSHIFTDomainEvaluator:
                        f"{metrics['num_images']:>8d} "
                        f"{metrics['num_gt']:>8d} "
                        f"{metrics['num_predictions']:>8d}\n")
+            
+            # Per-domain per-class breakdown
+            f.write("\n\n" + "="*100 + "\n")
+            f.write("Per-Domain Per-Class Breakdown\n")
+            f.write("="*100 + "\n")
+            
+            for domain in sorted(results.keys()):
+                if domain in ('overall', 'size_analysis'):
+                    continue
+                metrics = results[domain]
+                if 'per_class' not in metrics:
+                    continue
+                
+                f.write(f"\n── {domain} (mAP={metrics['mAP']:.4f}, mAP@50={metrics['mAP_50']:.4f}) ──\n")
+                self._write_per_class_table(f, metrics['per_class'])
             
             # Size analysis
             if 'size_analysis' in results:
@@ -866,6 +1041,25 @@ class VLMSHIFTDomainEvaluator:
         
         print(f"  ✓ Saved results to {results_file}")
         print(f"  ✓ Saved summary to {summary_file}")
+    
+    @staticmethod
+    def _write_per_class_table(f, per_class: Dict[str, Dict]):
+        """Write a per-class metrics table to file handle f."""
+        header = (f"  {'Class':<14s} {'GT':>5s} {'Pred':>6s} {'AP':>7s} {'AP@50':>7s} "
+                  f"{'AP@75':>7s} {'AR@100':>7s} {'TP':>5s} {'FP':>6s} {'FN':>5s} "
+                  f"{'Prec@50':>8s} {'Rec@50':>8s}")
+        f.write(header + "\n")
+        f.write("  " + "-" * (len(header) - 2) + "\n")
+        
+        for cls_name, m in per_class.items():
+            def _fmt(v): return f"{v:.4f}" if v >= 0 else "  N/A "
+            
+            f.write(f"  {cls_name:<14s} "
+                   f"{m['num_gt']:>5d} {m['num_predictions']:>6d} "
+                   f"{_fmt(m['AP']):>7s} {_fmt(m['AP_50']):>7s} "
+                   f"{_fmt(m['AP_75']):>7s} {_fmt(m['AR_100']):>7s} "
+                   f"{m['TP']:>5d} {m['FP']:>6d} {m['FN']:>5d} "
+                   f"{m['precision_at_50']:>8.4f} {m['recall_at_50']:>8.4f}\n")
 
 
 def create_shift_domain_evaluator(dataset, output_dir: str = "./shift_evaluation_results"):
