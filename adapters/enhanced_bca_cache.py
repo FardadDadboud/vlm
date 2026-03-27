@@ -43,6 +43,7 @@ class EnhancedBCAPlusConfig:
     # === Thresholds ===
     # tau1: Confidence threshold for cache UPDATE (only high-conf detections update cache)
     tau1: float = 0.6
+    tau1_per_class: Optional[Dict[int, float]] = None  # {class_id: threshold}
     
     # tau2: Similarity threshold for cache MATCH (matching original BCA+ behavior)
     # Use SINGLE tau2 for all entries - lifecycle state doesn't affect matching threshold
@@ -400,7 +401,17 @@ class EnhancedBCAPlusCache:
             return
         
         # Filter by confidence threshold
-        high_conf_mask = scores >= self.config.tau1
+        # high_conf_mask = scores >= self.config.tau1
+        # Filter by confidence threshold — CLASS-AWARE
+        if hasattr(self.config, 'tau1_per_class') and self.config.tau1_per_class is not None:
+            # Per-class thresholds
+            high_conf_mask = np.zeros(N, dtype=bool)
+            for i in range(N):
+                pred_class = int(np.argmax(probs[i]))
+                class_tau1 = self.config.tau1_per_class.get(pred_class, self.config.tau1)
+                high_conf_mask[i] = scores[i] >= class_tau1
+        else:
+            high_conf_mask = scores >= self.config.tau1
         n_low_conf = int(np.sum(~high_conf_mask))
         self._debug_updates_low_conf += n_low_conf
         

@@ -426,6 +426,8 @@ class GlobalInstanceAdapter(BaseAdapter):
         # Detection thresholds
         self.detection_threshold = params.get('detection_threshold', params.get('tau_update', 0.10))
         self.nms_threshold = params.get('nms_threshold', params.get('iou_threshold', 0.7))
+
+        
         
         # Global cache config (using single tau2 like original BCA+)
         self.cache_config = EnhancedBCAPlusConfig(
@@ -442,6 +444,22 @@ class GlobalInstanceAdapter(BaseAdapter):
             batch_init_size=params.get('batch_init_size', 10),
             debug=params.get('debug', False)
         )
+
+        # Class-aware tau1
+        tau1_base = params.get('tau1', 0.6)
+        tau1_per_class = params.get('tau1_per_class', None)
+        if tau1_per_class is None:
+            # Default: lower threshold for rare/weak classes
+            tau1_reduction = params.get('tau1_rare_class_reduction', 0.2)
+            tau1_per_class = {
+                0: tau1_base,                        # pedestrian
+                1: tau1_base,                        # car
+                2: tau1_base,                        # truck
+                3: max(0.1, tau1_base - tau1_reduction),  # bus
+                4: max(0.1, tau1_base - tau1_reduction),  # motorcycle
+                5: max(0.1, tau1_base - tau1_reduction),  # bicycle
+            }
+        self.cache_config.tau1_per_class = tau1_per_class
         
         # Per-track STAD config
         self.stad_config = TrackSTADConfig(
@@ -488,7 +506,10 @@ class GlobalInstanceAdapter(BaseAdapter):
         )
         
         # Track creation limits (CRITICAL for performance!)
-        self.track_creation_threshold = params.get('track_creation_threshold', 0.3)  # Only create tracks for high-conf dets
+        # Track creation threshold — class-aware
+        self.track_creation_threshold_default = params.get('track_creation_threshold', 0.5)
+        self.track_creation_threshold_weak = params.get('track_creation_threshold_weak', 0.35)
+        self.weak_track_classes = set(params.get('weak_track_classes', [3, 4, 5]))  # bus, moto, bicycle  # Only create tracks for high-conf dets
         self.max_tracks = params.get('max_tracks', 100)  # Limit total tracks
         self.association_fast_threshold = params.get('association_fast_threshold', 50)  # Use fast IoU-only when > this
         
@@ -513,7 +534,8 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.force_score_modulation = params.get('force_score_modulation', False)
         if not self.force_score_modulation and (self.use_global_cache or self.use_track_stad):
             self.use_track_score_modulation = False
-        self.confirmed_track_boost = params.get('confirmed_track_boost', 0.1)  # Add to score for confirmed tracks
+        self.confirmed_track_boost = params.get('confirmed_track_boost', 0.05)  # Add to score for confirmed tracks
+        self.score_blend_lambda = params.get('score_blend_lambda', 0.5)  # Blend factor for blended score
         self.tentative_track_penalty = params.get('tentative_track_penalty', 0.0)  # Subtract from tentative (0 = no penalty)
         self.untracked_penalty = params.get('untracked_penalty', 0.05)  # Subtract from untracked detections
         self.filter_untracked = params.get('filter_untracked', False)  # If True, remove untracked detections entirely
@@ -690,6 +712,27 @@ class GlobalInstanceAdapter(BaseAdapter):
     def set_video_name(self, video_name: str) -> None:
         """Set current video name for visual debug organization."""
         self._current_video_name = video_name
+
+    def _is_cache_ready(self) -> bool:
+        """Check if the global cache is mature enough to trust for score replacement."""
+        if self.global_cache is None:
+            return False
+        
+        # Condition 1: batch init must be done
+        if self.global_cache.config.use_batch_init and not self.global_cache.batch_init_done:
+            return False
+        
+        # Condition 2: minimum cache entries
+        if self.global_cache.M < 5:
+            return False
+        
+        # Condition 3: minimum number of classes represented in cache
+        if hasattr(self.global_cache, 'V_cache') and self.global_cache.M > 0:
+            cache_classes = set(np.argmax(self.global_cache.V_cache, axis=1))
+            if len(cache_classes) < 2:
+                return False
+        
+        return True
     
     def adapt_and_detect(self, image, target_classes: List[str],
                         threshold: float = None, **kwargs) -> Any:
@@ -780,30 +823,53 @@ class GlobalInstanceAdapter(BaseAdapter):
         # Store posteriors for cache update (frozen snapshot - matches original BCA+!)
         cache_posteriors = None
         
+        # if self.use_global_cache and self.global_cache is not None:
+        #     # CRITICAL: Get posteriors computed against FROZEN cache snapshot!
+        #     # These will be used for cache update to match original BCA+ behavior
+        #     global_adapted_probs, cache_posteriors = self.global_cache.adapt_probs_batch(
+        #         features, boxes, class_probs, return_posteriors=True
+        #     )
+        #     # Compute adaptation effect
+        #     adapt_diff = np.abs(global_adapted_probs - class_probs)
+        #     dbg['adapt_L1_mean'] = float(np.mean(adapt_diff))
+        #     dbg['adapt_L1_max'] = float(np.max(adapt_diff))
+            
+        #     # CRITICAL FIX: Update scores and labels from adapted probs (matching original BCA+!)
+        #     # In original BCA+, adapted class_probs determine scores and labels for filtering/NMS
+        #     adapted_scores = np.max(global_adapted_probs, axis=1)  # Score = max class prob
+        #     adapted_label_indices = np.argmax(global_adapted_probs, axis=1)
+        #     adapted_labels = [self.target_classes[idx] for idx in adapted_label_indices]
+            
+        #     # Use adapted scores for filtering and NMS
+        #     scores = adapted_scores
+        #     labels = adapted_labels
+        #     dbg['used_adapted_scores'] = True
+        # else:
+        #     global_adapted_probs = class_probs.copy()
+        #     dbg['used_adapted_scores'] = False
+        # ===== Stage 3: Global BCA+ Adaptation =====
         if self.use_global_cache and self.global_cache is not None:
-            # CRITICAL: Get posteriors computed against FROZEN cache snapshot!
-            # These will be used for cache update to match original BCA+ behavior
+            # Always compute adapted probs (for cache update and fusion)
             global_adapted_probs, cache_posteriors = self.global_cache.adapt_probs_batch(
                 features, boxes, class_probs, return_posteriors=True
             )
-            # Compute adaptation effect
-            adapt_diff = np.abs(global_adapted_probs - class_probs)
-            dbg['adapt_L1_mean'] = float(np.mean(adapt_diff))
-            dbg['adapt_L1_max'] = float(np.max(adapt_diff))
             
-            # CRITICAL FIX: Update scores and labels from adapted probs (matching original BCA+!)
-            # In original BCA+, adapted class_probs determine scores and labels for filtering/NMS
-            adapted_scores = np.max(global_adapted_probs, axis=1)  # Score = max class prob
-            adapted_label_indices = np.argmax(global_adapted_probs, axis=1)
-            adapted_labels = [self.target_classes[idx] for idx in adapted_label_indices]
+            # GATE: Only use adapted scores for threshold/NMS when cache is mature
+            cache_ready = self._is_cache_ready()
             
-            # Use adapted scores for filtering and NMS
-            scores = adapted_scores
-            labels = adapted_labels
-            dbg['used_adapted_scores'] = True
+            if cache_ready:
+                # Cache is healthy — use adapted scores for filtering/NMS
+                adapted_scores = np.max(global_adapted_probs, axis=1)
+                adapted_label_indices = np.argmax(global_adapted_probs, axis=1)
+                adapted_labels = [self.target_classes[idx] for idx in adapted_label_indices]
+                scores = adapted_scores
+                labels = adapted_labels
+            else:
+                # Cache still warming up — keep raw VLM scores for threshold/NMS
+                # But still pass adapted probs downstream for fusion
+                pass  # scores and labels stay as raw VLM values
         else:
             global_adapted_probs = class_probs.copy()
-            dbg['used_adapted_scores'] = False
         timings['global_cache_adapt'] = time.perf_counter() - t0
         
         # ===== Stage 4: Filter by threshold =====
@@ -856,13 +922,13 @@ class GlobalInstanceAdapter(BaseAdapter):
             # ===== PRE-FILTERING FOR TRACKING ONLY =====
             # Filter creates a SUBSET for association (faster), but we keep ALL detections for output
             should_prefilter = (
-                self.track_creation_threshold > 0 and
+                self.track_creation_threshold_default > 0 and
                 (self.aggressive_prefilter or len(active_tracks) == 0)
             )
             
             if should_prefilter:
                 # Create indices of detections to use for tracking
-                track_mask = nms_scores >= self.track_creation_threshold
+                track_mask = nms_scores >= self.track_creation_threshold_default
                 track_indices = np.where(track_mask)[0]  # Indices into original nms_* arrays
                 n_pre_filtered = N_nms - len(track_indices)
             else:
@@ -963,7 +1029,18 @@ class GlobalInstanceAdapter(BaseAdapter):
                     orig_idx = track_indices[det_idx]  # Map back to original index
                     
                     # Check score threshold (already filtered, but double-check)
-                    if nms_scores[orig_idx] < self.track_creation_threshold:
+                    # if nms_scores[orig_idx] < self.track_creation_threshold:
+                    #     tracks_skipped_low_conf += 1
+                    #     continue
+
+                    # Check score threshold — CLASS-AWARE
+                    det_class_idx = self.target_classes.index(nms_labels[orig_idx]) if nms_labels[orig_idx] in self.target_classes else 0
+                    if det_class_idx in self.weak_track_classes:
+                        effective_threshold = self.track_creation_threshold_weak
+                    else:
+                        effective_threshold = self.track_creation_threshold_default
+
+                    if nms_scores[orig_idx] < effective_threshold:
                         tracks_skipped_low_conf += 1
                         continue
                     
@@ -1070,76 +1147,109 @@ class GlobalInstanceAdapter(BaseAdapter):
         
         # ===== Stage 10: Track-based Score Modulation (CRITICAL for tracking to impact mAP!) =====
         # Without this, tracking_only gives same mAP as vanilla because we don't change scores
-        final_scores = nms_scores.copy()
+        # final_scores = nms_scores.copy()
         score_mod_stats = {'boosted': 0, 'penalized_tentative': 0, 'penalized_untracked': 0, 
                           'filtered_untracked': 0, 'smoothed': 0}
         
-        if self.use_tracking and self.use_track_score_modulation:
-            active_tracks = self.track_manager.get_active_tracks() if self.track_manager else []
-            track_id_to_track = {t.track_id: t for t in active_tracks}
+        # if self.use_tracking and self.use_track_score_modulation:
+        #     active_tracks = self.track_manager.get_active_tracks() if self.track_manager else []
+        #     track_id_to_track = {t.track_id: t for t in active_tracks}
             
-            keep_indices = []  # For filter_untracked mode
+        #     keep_indices = []  # For filter_untracked mode
+            
+        #     for i in range(N_nms):
+        #         tid = track_ids[i]
+        #         current_score = final_scores[i]
+                
+        #         if tid >= 0 and tid in track_id_to_track:
+        #             track = track_id_to_track[tid]
+                    
+        #             # Temporal score smoothing: Use track's score history for stability
+        #             if self.use_temporal_score_smoothing and hasattr(track, 'score_history'):
+        #                 if len(track.score_history) > 0:
+        #                     avg_score = np.mean(track.score_history[-self.score_smoothing_window:])
+        #                     smoothed = (1 - self.score_smoothing_alpha) * current_score + \
+        #                                self.score_smoothing_alpha * avg_score
+        #                     final_scores[i] = smoothed
+        #                     score_mod_stats['smoothed'] += 1
+                    
+        #             # Track state-based boost/penalty
+        #             if track.is_confirmed():
+        #                 # Boost confirmed track detections
+        #                 final_scores[i] = min(1.0, final_scores[i] + self.confirmed_track_boost)
+        #                 score_mod_stats['boosted'] += 1
+        #             elif track.is_tentative() and self.tentative_track_penalty > 0:
+        #                 # Optionally penalize tentative tracks
+        #                 final_scores[i] = max(0.0, final_scores[i] - self.tentative_track_penalty)
+        #                 score_mod_stats['penalized_tentative'] += 1
+        #             keep_indices.append(i)
+        #         else:
+        #             # Untracked detection
+        #             if self.filter_untracked:
+        #                 score_mod_stats['filtered_untracked'] += 1
+        #                 # Don't add to keep_indices
+        #             else:
+        #                 final_scores[i] = max(0.0, final_scores[i] - self.untracked_penalty)
+        #                 score_mod_stats['penalized_untracked'] += 1
+        #                 keep_indices.append(i)
+            
+        #     # Apply filtering if enabled
+        #     if self.filter_untracked and len(keep_indices) < N_nms:
+        #         keep_indices = np.array(keep_indices)
+        #         nms_boxes = nms_boxes[keep_indices]
+        #         final_scores = final_scores[keep_indices]
+        #         nms_features = nms_features[keep_indices]
+        #         final_probs = final_probs[keep_indices]
+        #         nms_raw_probs = nms_raw_probs[keep_indices]
+        #         nms_labels = [nms_labels[i] for i in keep_indices]
+        #         track_ids = [track_ids[i] for i in keep_indices]
+        #         N_nms = len(keep_indices)
+        # else:
+        #     # Score modulation disabled (STAD active)
+        #     # Option: use max(final_probs) as score for TRACKED detections only
+        #     if self.use_stad_adapted_scores and self.use_track_stad:
+        #         # Only change scores for tracked detections, keep original for untracked
+        #         final_scores = nms_scores.copy()
+        #         for i in range(N_nms):
+        #             if track_ids[i] >= 0:  # Only for tracked detections
+        #                 final_scores[i] = np.max(final_probs[i])
+        #         score_mod_stats['used_stad_scores'] = True
+        #         score_mod_stats['stad_scores_applied'] = sum(1 for tid in track_ids if tid >= 0)
+        #     else:
+        #         final_scores = nms_scores  # No modulation, keep original VLM scores
+
+        # ===== Stage 10: Final Score Computation =====
+        final_scores = nms_scores.copy()
+
+        if self.use_tracking and self.track_manager is not None:
+            active_tracks = self.track_manager.get_active_tracks()
+            track_id_to_track = {t.track_id: t for t in active_tracks}
             
             for i in range(N_nms):
                 tid = track_ids[i]
-                current_score = final_scores[i]
                 
                 if tid >= 0 and tid in track_id_to_track:
                     track = track_id_to_track[tid]
                     
-                    # Temporal score smoothing: Use track's score history for stability
+                    # BLENDED SCORE: mix raw VLM score with max(fused_probs)
+                    # This lets STAD/fusion influence ranking for ALL classes
+                    fused_max = float(np.max(final_probs[i]))
+                    lambda_blend = self.score_blend_lambda
+                    final_scores[i] = lambda_blend * nms_scores[i] + (1 - lambda_blend) * fused_max
+                    
+                    # Temporal smoothing on top (optional, keep existing)
                     if self.use_temporal_score_smoothing and hasattr(track, 'score_history'):
                         if len(track.score_history) > 0:
                             avg_score = np.mean(track.score_history[-self.score_smoothing_window:])
-                            smoothed = (1 - self.score_smoothing_alpha) * current_score + \
-                                       self.score_smoothing_alpha * avg_score
-                            final_scores[i] = smoothed
-                            score_mod_stats['smoothed'] += 1
+                            final_scores[i] = (1 - self.score_smoothing_alpha) * final_scores[i] + \
+                                            self.score_smoothing_alpha * avg_score
                     
-                    # Track state-based boost/penalty
+                    # Track state boost (smaller than before since fusion handles confidence)
                     if track.is_confirmed():
-                        # Boost confirmed track detections
                         final_scores[i] = min(1.0, final_scores[i] + self.confirmed_track_boost)
-                        score_mod_stats['boosted'] += 1
-                    elif track.is_tentative() and self.tentative_track_penalty > 0:
-                        # Optionally penalize tentative tracks
-                        final_scores[i] = max(0.0, final_scores[i] - self.tentative_track_penalty)
-                        score_mod_stats['penalized_tentative'] += 1
-                    keep_indices.append(i)
                 else:
-                    # Untracked detection
-                    if self.filter_untracked:
-                        score_mod_stats['filtered_untracked'] += 1
-                        # Don't add to keep_indices
-                    else:
-                        final_scores[i] = max(0.0, final_scores[i] - self.untracked_penalty)
-                        score_mod_stats['penalized_untracked'] += 1
-                        keep_indices.append(i)
-            
-            # Apply filtering if enabled
-            if self.filter_untracked and len(keep_indices) < N_nms:
-                keep_indices = np.array(keep_indices)
-                nms_boxes = nms_boxes[keep_indices]
-                final_scores = final_scores[keep_indices]
-                nms_features = nms_features[keep_indices]
-                final_probs = final_probs[keep_indices]
-                nms_raw_probs = nms_raw_probs[keep_indices]
-                nms_labels = [nms_labels[i] for i in keep_indices]
-                track_ids = [track_ids[i] for i in keep_indices]
-                N_nms = len(keep_indices)
-        else:
-            # Score modulation disabled (STAD active)
-            # Option: use max(final_probs) as score for TRACKED detections only
-            if self.use_stad_adapted_scores and self.use_track_stad:
-                # Only change scores for tracked detections, keep original for untracked
-                final_scores = nms_scores.copy()
-                for i in range(N_nms):
-                    if track_ids[i] >= 0:  # Only for tracked detections
-                        final_scores[i] = np.max(final_probs[i])
-                score_mod_stats['used_stad_scores'] = True
-                score_mod_stats['stad_scores_applied'] = sum(1 for tid in track_ids if tid >= 0)
-            else:
-                final_scores = nms_scores  # No modulation, keep original VLM scores
+                    # Untracked: keep raw score, small penalty
+                    final_scores[i] = max(0.0, final_scores[i] - self.untracked_penalty)
         
         dbg['score_mod'] = score_mod_stats
         
