@@ -44,6 +44,7 @@ try:
         EnhancedBCAPlusCache, EnhancedBCAPlusConfig, CacheEntryState
     )
     from .base_adapter import BaseAdapter
+    from .trust_diagnostics import TrustDiagnostics
 except ImportError:
     # Standalone import
     from track import (
@@ -56,6 +57,7 @@ except ImportError:
         EnhancedBCAPlusCache, EnhancedBCAPlusConfig, CacheEntryState
     )
     from base_adapter import BaseAdapter
+    from trust_diagnostics import TrustDiagnostics
 
 
 # =============================================================================
@@ -345,8 +347,13 @@ class GlobalInstanceAdapter(BaseAdapter):
         
         self.config = config
         self.detector = detector
+
+        # Parse diagnostics config from params (done in _parse_config, but init happens first)
+        # We'll re-init after _parse_config. Use placeholder here.
+        self.trust_diagnostics = None  # Will be initialized in _parse_config
         
         # Parse config
+        print(f"Parsing config's output directory: {config.get('output_dir', '.')}")
         self._parse_config(config)
         
         # Get detector info
@@ -367,8 +374,9 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.total_detections = 0
         self.total_adapted = 0
         
-        # Visual debug
+        # Visual debug and diagnostics
         self._current_video_name = None
+        
     
     def _parse_config(self, config: Dict) -> None:
         """Parse configuration dictionary."""
@@ -382,6 +390,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         else:
             params = config
             config_path = 'config (root level)'
+
         
         # Store for debug logging
         self._config_path = config_path
@@ -428,7 +437,6 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.nms_threshold = params.get('nms_threshold', params.get('iou_threshold', 0.7))
 
         
-        
         # Global cache config (using single tau2 like original BCA+)
         self.cache_config = EnhancedBCAPlusConfig(
             tau1=params.get('tau1', 0.6),
@@ -445,20 +453,23 @@ class GlobalInstanceAdapter(BaseAdapter):
             debug=params.get('debug', False)
         )
 
-        # Class-aware tau1
+        # Class-aware tau1 — use SEPARATE weak class list for cache
         tau1_base = params.get('tau1', 0.6)
         tau1_per_class = params.get('tau1_per_class', None)
+        if tau1_per_class is not None:
+            tau1_per_class = {int(k): v for k, v in tau1_per_class.items()}
         if tau1_per_class is None:
-            # Default: lower threshold for rare/weak classes
             tau1_reduction = params.get('tau1_rare_class_reduction', 0.2)
-            tau1_per_class = {
-                0: tau1_base,                        # pedestrian
-                1: tau1_base,                        # car
-                2: tau1_base,                        # truck
-                3: max(0.1, tau1_base - tau1_reduction),  # bus
-                4: max(0.1, tau1_base - tau1_reduction),  # motorcycle
-                5: max(0.1, tau1_base - tau1_reduction),  # bicycle
-            }
+            # Cache weakness: only for classes that are GENUINELY rare in detections
+            # NOT for classes with high FP rates (bus, bicycle)
+            weak_cache_classes = set(params.get('weak_cache_classes', [4]))  # motorcycle only
+            tau1_per_class = {}
+            for cls_idx in range(6):
+                if cls_idx in weak_cache_classes:
+                    tau1_per_class[cls_idx] = max(0.1, tau1_base - tau1_reduction)
+                else:
+                    tau1_per_class[cls_idx] = tau1_base
+
         self.cache_config.tau1_per_class = tau1_per_class
         
         # Per-track STAD config
@@ -491,7 +502,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         
         # STAD variant
         self.stad_variant = params.get('ssm_type', params.get('stad_variant', 'vmf'))
-        
+  
         # Track config
         self.track_config = TrackConfig(
             min_hits_to_confirm=params.get('min_hits_to_confirm', 3),
@@ -588,6 +599,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         
         # Visual debug (especially for tracking_only mode)
         self.visual_debug = params.get('visual_debug', self.mode == 'tracking_only')
+        print(f"visual debug output directory: {os.path.join(params.get('output_dir', './tracking_debug'), 'tracking_debug')}")
         self.visual_debug_dir = os.path.join(params.get('output_dir', './tracking_debug'), 'tracking_debug')
         
         # Sanity warning thresholds
@@ -605,6 +617,16 @@ class GlobalInstanceAdapter(BaseAdapter):
         # One-time debug print of resolved params
         if self.debug:
             self._print_config_debug()
+
+        # Diagnostics (structured persistent logging — separate from console debug)
+        self.diagnostics_enabled = params.get('diagnostics', False)
+        self.trust_diagnostics = TrustDiagnostics(
+            output_dir=os.path.join(params.get('output_dir', '.'), 'trust_diagnostics'),
+            enabled=self.diagnostics_enabled,
+            save_crops=params.get('diagnostic_crops', False),
+            max_crops_per_class=params.get('diagnostic_max_crops', 50),
+            log_every=params.get('diagnostic_log_every', 1),
+        )
     
     def _print_config_debug(self) -> None:
         """Print configuration debug info."""
@@ -728,7 +750,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         
         # Condition 3: minimum number of classes represented in cache
         if hasattr(self.global_cache, 'V_cache') and self.global_cache.M > 0:
-            cache_classes = set(np.argmax(self.global_cache.V_cache, axis=1))
+            cache_classes = set(np.argmax(self.global_cache.V_cache, axis=0))
             if len(cache_classes) < 2:
                 return False
         
@@ -811,7 +833,8 @@ class GlobalInstanceAdapter(BaseAdapter):
         
         # Lazy init components
         self._lazy_init_components(features.shape[1])
-        
+
+        self._diag('log_vlm_raw', scores, labels, class_probs, self.frame_count, self._current_video_name)      
         # ===== Stage 2: Store RAW VLM probs (BEFORE any adaptation) =====
         raw_vlm_probs = class_probs.copy()
         
@@ -871,6 +894,9 @@ class GlobalInstanceAdapter(BaseAdapter):
         else:
             global_adapted_probs = class_probs.copy()
         timings['global_cache_adapt'] = time.perf_counter() - t0
+
+        self._diag('log_cache_state', self.global_cache, self.frame_count, self._current_video_name)
+        self._diag('log_cache_adaptation', raw_vlm_probs, global_adapted_probs, labels, self.frame_count)
         
         # ===== Stage 4: Filter by threshold =====
         keep_mask = scores >= threshold
@@ -1014,6 +1040,10 @@ class GlobalInstanceAdapter(BaseAdapter):
                         p_global = nms_global_probs[orig_idx]  # Global cache adapted
                         p_track = track.get_class_probs()     # Per-track STAD belief
                         final_probs[orig_idx] = self._fuse_probs(p_init, p_global, p_track, track)
+
+                        self._diag('log_fusion_decision',
+                            p_init, p_global, p_track, final_probs[orig_idx],
+                            track.hits, track.track_id, self.frame_count)
                         
                         # Check if STAD changed the class
                         stad_class_idx = np.argmax(p_track)
@@ -1128,6 +1158,11 @@ class GlobalInstanceAdapter(BaseAdapter):
                 # Alternative: use raw VLM probs (prevents self-reinforcement)
                 cache_update_probs = nms_raw_probs
                 dbg['cache_update_probs'] = 'raw'
+
+            self._diag('log_cache_update_attempt', 
+                       cache_update_probs, nms_scores,
+                       self.cache_config.tau1, self.cache_config.tau1_per_class,
+                       self.frame_count)
             
             # CRITICAL: Pass pre-computed posteriors (frozen snapshot - matches original BCA+!)
             self.global_cache.update_cache(
@@ -1236,7 +1271,7 @@ class GlobalInstanceAdapter(BaseAdapter):
                     fused_max = float(np.max(final_probs[i]))
                     lambda_blend = self.score_blend_lambda
                     final_scores[i] = lambda_blend * nms_scores[i] + (1 - lambda_blend) * fused_max
-                    
+
                     # Temporal smoothing on top (optional, keep existing)
                     if self.use_temporal_score_smoothing and hasattr(track, 'score_history'):
                         if len(track.score_history) > 0:
@@ -1377,6 +1412,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         
         # Print timing and debug info every debug_every frames
         timings['total'] = time.perf_counter() - t_start
+        self._diag('log_frame_timing', timings, self.frame_count)
         self._debug_log_frame(dbg, timings, t_start)
         
         # Visual debug - save tracking visualization
@@ -1399,11 +1435,23 @@ class GlobalInstanceAdapter(BaseAdapter):
                     print(f"[Warning] Visual debug save failed: {e}")
         
         self._end_frame()
+        self._diag('log_track_stad_beliefs', self.track_manager, self.frame_count)
         
         return result
     
+    def _diag(self, method_name: str, *args, **kwargs):
+        """Call a diagnostics method without contaminating pipeline timings."""
+        if self.trust_diagnostics is None or not self.diagnostics_enabled:
+            return
+        getattr(self.trust_diagnostics, method_name)(*args, **kwargs)
+    
     def _debug_log_frame(self, dbg: Dict, timings: Dict, t_start: float) -> None:
-        """Print per-frame debug info and sanity warnings."""
+        """Print per-frame debug info and sanity warnings.
+        
+        NOTE: This is CONSOLE debug output, controlled by config "debug": true.
+        Structured persistent logging (file-based) is handled separately by
+        TrustDiagnostics, controlled by config "diagnostics": true.
+        """
         if not self.debug:
             return
         
@@ -1587,6 +1635,12 @@ class GlobalInstanceAdapter(BaseAdapter):
             (K,) fused class probabilities
         """
         eps = 1e-10
+
+        track_maturity = 0.0
+        if track is not None:
+            # Ramp from 0 to 1 over first N hits
+            maturity_ramp = min(1.0, track.hits / max(1, self.track_config.min_hits_to_confirm * 2))
+            track_maturity = maturity_ramp
         
         if self.fusion_mode == 'parallel':
             # Weighted average of all three sources
@@ -1651,9 +1705,9 @@ class GlobalInstanceAdapter(BaseAdapter):
                 p_track = np.zeros_like(p_track)
                 H_track = 1e10
             
-            w_init = np.exp(-H_init)
+            w_init = np.exp(-H_init) * (1 - track_maturity)
             w_global = np.exp(-H_global)
-            w_track = np.exp(-H_track)
+            w_track = np.exp(-H_track) * track_maturity
             
             total = w_init + w_global + w_track + eps
             fused = (w_init * p_init + w_global * p_global + w_track * p_track) / total
@@ -1885,6 +1939,11 @@ class GlobalInstanceAdapter(BaseAdapter):
     
     def reset(self) -> None:
         """Reset all state for new video."""
+        # Flush diagnostics BEFORE resetting state
+        
+        if self.trust_diagnostics is not None:
+            self.trust_diagnostics.flush_video(self._current_video_name)
+        
         if self.global_cache is not None:
             self.global_cache.reset()
         

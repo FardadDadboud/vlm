@@ -644,9 +644,22 @@ class EnhancedBCAPlusCache:
         """Collect detections for batch initialization."""
         N = len(features)
         
+        # for i in range(N):
+        #     if scores[i] >= self.config.tau1:
+        #         # Store boxes directly (original BCA+ style) - NOT scalar area
+        #         self.init_buffer_features.append(features[i])
+        #         self.init_buffer_boxes.append(boxes[i])  # Store full box [x1,y1,x2,y2]
+        #         self.init_buffer_probs.append(probs[i])
+        #         self.init_buffer_scores.append(scores[i])
+
         for i in range(N):
-            if scores[i] >= self.config.tau1:
-                # Store boxes directly (original BCA+ style) - NOT scalar area
+            # Use per-class tau1 if available (matching update_cache behavior)
+            if hasattr(self.config, 'tau1_per_class') and self.config.tau1_per_class is not None:
+                pred_class = int(np.argmax(probs[i]))
+                effective_tau1 = self.config.tau1_per_class.get(pred_class, self.config.tau1)
+            else:
+                effective_tau1 = self.config.tau1
+            if scores[i] >= effective_tau1:
                 self.init_buffer_features.append(features[i])
                 self.init_buffer_boxes.append(boxes[i])  # Store full box [x1,y1,x2,y2]
                 self.init_buffer_probs.append(probs[i])
@@ -775,6 +788,19 @@ class EnhancedBCAPlusCache:
                     centroid_scale[0] * self.image_size[0],  # w in pixels
                     centroid_scale[1] * self.image_size[1]   # h in pixels
                 ])
+
+                # Before creating a new cache entry:
+                pred_class_idx = int(np.argmax(mean_prob))
+
+                # Count existing entries for this class
+                class_count = 0
+                for j in range(self.M):
+                    if int(np.argmax(self.V_cache[:, j])) == pred_class_idx:
+                        class_count += 1
+
+                max_per_class = max(2, self.config.max_cache_size // 6)  # e.g., 25//6 = 4
+                if class_count >= max_per_class:
+                    continue  # Skip — this class already has enough entries
                 
                 self._create_entry(
                     feature=cluster['centroid_feature'],

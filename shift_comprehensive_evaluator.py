@@ -201,8 +201,9 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
                 break
             image_path = sample['image_path']
             image = Image.open(image_path)
-            
+            detector.set_video_name(video_id)
             detection_result = detector.adapt_and_detect(image, target_classes, threshold=threshold)
+            detector.set_video_name(None)
             
             pred = {
                 'image_id': sample['image_info']['id'],
@@ -255,11 +256,16 @@ def main():
     print("SHIFT Comprehensive Baseline Evaluation")
     print("="*80)
     print(f"\nConfiguration:")
-    print(json.dumps(CONFIG, indent=2))
+    
     
     # Create output directory
     output_dir = Path(CONFIG['output_dir']) / time.strftime("%Y%m%d_%H%M%S")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # update the output_dir in the config
+    CONFIG['output_dir'] = str(output_dir)
+    CONFIG['adaptation']['params']['output_dir'] = str(output_dir)
+    print(json.dumps(CONFIG, indent=2))
     
     # Save config
     with open(output_dir / 'config.json', 'w') as f:
@@ -307,6 +313,7 @@ def main():
     else:
         raise ValueError(f"Unknown detector: {CONFIG['detector']['name']}")
 
+    print(f"\nAdapter config: {CONFIG['output_dir']}")
     # Wrap with adapter
     detector = create_adapter(
         adaptation_type=CONFIG['adaptation']['type'],
