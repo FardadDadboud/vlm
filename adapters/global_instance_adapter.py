@@ -353,7 +353,6 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.trust_diagnostics = None  # Will be initialized in _parse_config
         
         # Parse config
-        print(f"Parsing config's output directory: {config.get('output_dir', '.')}")
         self._parse_config(config)
         
         # Get detector info
@@ -735,6 +734,38 @@ class GlobalInstanceAdapter(BaseAdapter):
         """Set current video name for visual debug organization."""
         self._current_video_name = video_name
 
+    def _compute_cache_health(self) -> float:
+        """
+        Compute cache health score in [0, 1].
+        1.0 = healthy diverse cache, 0.0 = sick dominated cache.
+        Used to dynamically scale cache influence.
+        """
+        if self.global_cache is None or self.global_cache.M < 3:
+            return 0.0  # Not enough entries to trust
+        
+        M = self.global_cache.M
+        
+        # Signal A: Class diversity (normalized entropy)
+        class_counts = {}
+        for j in range(M):
+            cls = int(np.argmax(self.global_cache.V_cache[:, j]))
+            class_counts[cls] = class_counts.get(cls, 0) + 1
+        
+        probs = np.array(list(class_counts.values()), dtype=float)
+        probs = probs / probs.sum()
+        entropy = -np.sum(probs * np.log(probs + 1e-10))
+        max_entropy = np.log(min(len(class_counts), self.num_classes))
+        diversity = entropy / (max_entropy + 1e-10) if max_entropy > 0 else 0.0
+        
+        # Signal B: No single class should exceed 50% of cache
+        max_fraction = probs.max()
+        domination_penalty = max(0.0, 1.0 - 2.0 * (max_fraction - 0.5)) if max_fraction > 0.5 else 1.0
+        
+        # Combined health: both must be good
+        health = diversity * domination_penalty
+        
+        return float(np.clip(health, 0.0, 1.0))
+
     def _is_cache_ready(self) -> bool:
         """Check if the global cache is mature enough to trust for score replacement."""
         if self.global_cache is None:
@@ -872,25 +903,34 @@ class GlobalInstanceAdapter(BaseAdapter):
         #     dbg['used_adapted_scores'] = False
         # ===== Stage 3: Global BCA+ Adaptation =====
         if self.use_global_cache and self.global_cache is not None:
-            # Always compute adapted probs (for cache update and fusion)
             global_adapted_probs, cache_posteriors = self.global_cache.adapt_probs_batch(
                 features, boxes, class_probs, return_posteriors=True
             )
             
-            # GATE: Only use adapted scores for threshold/NMS when cache is mature
-            cache_ready = self._is_cache_ready()
+            # HEALTH-GATED: Only use adapted scores when cache is healthy
+            cache_health = self._compute_cache_health()
+            cache_ready = self._is_cache_ready() and cache_health > 0.3
+
+            dbg['cache_health'] = cache_health
+            dbg['cache_ready'] = cache_ready
+
+            print(f"       Cache health: {dbg.get('cache_health', 0):.3f} "
+                  f"(ready={dbg.get('cache_ready', False)})")
             
             if cache_ready:
-                # Cache is healthy — use adapted scores for filtering/NMS
+                # Blend adapted and raw scores based on health
+                # health=1.0 → full adapted, health=0.3 → mostly raw
+                blend = cache_health  # 0.0 to 1.0
                 adapted_scores = np.max(global_adapted_probs, axis=1)
-                adapted_label_indices = np.argmax(global_adapted_probs, axis=1)
-                adapted_labels = [self.target_classes[idx] for idx in adapted_label_indices]
-                scores = adapted_scores
-                labels = adapted_labels
+                raw_scores = np.max(class_probs, axis=1)
+                scores = blend * adapted_scores + (1 - blend) * raw_scores
+                
+                # Only replace labels when cache is very healthy
+                if cache_health > 0.6:
+                    adapted_label_indices = np.argmax(global_adapted_probs, axis=1)
+                    labels = [self.target_classes[idx] for idx in adapted_label_indices]
             else:
-                # Cache still warming up — keep raw VLM scores for threshold/NMS
-                # But still pass adapted probs downstream for fusion
-                pass  # scores and labels stay as raw VLM values
+                pass  # Keep raw VLM scores
         else:
             global_adapted_probs = class_probs.copy()
         timings['global_cache_adapt'] = time.perf_counter() - t0

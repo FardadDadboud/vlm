@@ -191,6 +191,7 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
         if hasattr(detector, 'reset'):
             detector.reset()
         
+        detector.set_video_name(video_id)
         # Sort by frame number if available
         samples.sort(key=lambda x: x[1].get('frame_idx', x[0]))
         
@@ -201,9 +202,7 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
                 break
             image_path = sample['image_path']
             image = Image.open(image_path)
-            detector.set_video_name(video_id)
             detection_result = detector.adapt_and_detect(image, target_classes, threshold=threshold)
-            detector.set_video_name(None)
             
             pred = {
                 'image_id': sample['image_info']['id'],
@@ -227,6 +226,8 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
                   f"Frames: {total_processed} | "
                   f"Time: {elapsed:.1f}s")
     
+    if hasattr(detector, 'reset'):
+        detector.reset()
     total_time = time.time() - start_time
     print(f"\n✓ Detection complete: {total_processed} frames from {video_idx+1} videos "
           f"in {total_time:.2f}s ({total_processed/total_time:.2f} FPS)")

@@ -507,6 +507,14 @@ class EnhancedBCAPlusCache:
         else:
             # No good match - create new entry
             if self.M < self.config.max_cache_size:
+                pred_class_idx = int(np.argmax(prob))
+                class_count = 0
+                for j in range(self.M):
+                    if int(np.argmax(self.V_cache[:, j])) == pred_class_idx:
+                        class_count += 1
+                max_per_class = max(2, self.config.max_cache_size // 6)
+                if class_count >= max_per_class:
+                    return  # This class already has enough cache entries
                 self._create_entry(feature, box, prob, score)
                 self._debug_entries_created += 1
                 
@@ -557,6 +565,14 @@ class EnhancedBCAPlusCache:
         else:
             # No good match - create new entry
             if self.M < self.config.max_cache_size:
+                pred_class_idx = int(np.argmax(prob))
+                class_count = 0
+                for j in range(self.M):
+                    if int(np.argmax(self.V_cache[:, j])) == pred_class_idx:
+                        class_count += 1
+                max_per_class = max(2, self.config.max_cache_size // 6)
+                if class_count >= max_per_class:
+                    return  # This class already has enough cache entries
                 self._create_entry(feature, box, prob, score)
                 self._debug_entries_created += 1
                 

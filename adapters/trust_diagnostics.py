@@ -428,48 +428,48 @@ class TrustDiagnostics:
         """Write accumulated logs for this video and reset."""
         if not self.enabled:
             return
-        if video_name is None:
-            video_name = "unknown_video"
+
         
-        video_dir = self.output_dir / video_name
-        video_dir.mkdir(parents=True, exist_ok=True)
+        video_dir = self.output_dir / video_name if video_name is not None else None
+        if video_dir is not None:
+            video_dir.mkdir(parents=True, exist_ok=True)
         
-        # Capture resource usage BEFORE generating report
-        self.log_gpu_memory()
-        self.log_ram_usage()
+            # Capture resource usage BEFORE generating report
+            self.log_gpu_memory()
+            self.log_ram_usage()
+            
+            report = self._generate_video_report(video_name)
+            
+            # Add resource usage to report
+            if hasattr(self, '_gpu_memory'):
+                report['gpu_memory'] = self._gpu_memory
+            if hasattr(self, '_ram_mb'):
+                report['ram_usage_mb'] = self._ram_mb
+            
+            # Save JSON report
+            with open(video_dir / f"diagnostics_{video_name}.json", 'w') as f:
+                json.dump(report, f, indent=2, default=str)
         
-        report = self._generate_video_report(video_name)
-        
-        # Add resource usage to report
-        if hasattr(self, '_gpu_memory'):
-            report['gpu_memory'] = self._gpu_memory
-        if hasattr(self, '_ram_mb'):
-            report['ram_usage_mb'] = self._ram_mb
-        
-        # Save JSON report
-        with open(video_dir / "diagnostics.json", 'w') as f:
-            json.dump(report, f, indent=2, default=str)
-        
-        # Save human-readable summary
-        with open(video_dir / "summary.txt", 'w') as f:
-            self._write_summary(f, report, video_name)
-        
-        # Save detailed logs
-        if self.fusion_disagreements:
-            with open(video_dir / "fusion_disagreements.json", 'w') as f:
-                json.dump(self.fusion_disagreements[:1000], f, indent=2)
-        
-        if self.adaptation_class_changes:
-            with open(video_dir / "relabeling_events.json", 'w') as f:
-                json.dump(self.adaptation_class_changes[:1000], f, indent=2)
-        
-        # Save track belief histories (top 20 longest tracks)
-        if self.track_belief_histories:
-            sorted_tracks = sorted(self.track_belief_histories.items(), 
-                                    key=lambda x: len(x[1]), reverse=True)[:20]
-            beliefs = {str(tid): hist for tid, hist in sorted_tracks}
-            with open(video_dir / "track_beliefs.json", 'w') as f:
-                json.dump(beliefs, f, indent=2)
+            # Save human-readable summary
+            with open(video_dir / f"summary_{video_name}.txt", 'w') as f:
+                self._write_summary(f, report, video_name)
+            
+            # Save detailed logs
+            if self.fusion_disagreements:
+                with open(video_dir / f"fusion_disagreements_{video_name}.json", 'w') as f:
+                    json.dump(self.fusion_disagreements[:1000], f, indent=2)
+            
+            if self.adaptation_class_changes:
+                with open(video_dir / f"relabeling_events_{video_name}.json", 'w') as f:
+                    json.dump(self.adaptation_class_changes[:1000], f, indent=2)
+            
+            # Save track belief histories (top 20 longest tracks)
+            if self.track_belief_histories:
+                sorted_tracks = sorted(self.track_belief_histories.items(), 
+                                        key=lambda x: len(x[1]), reverse=True)[:20]
+                beliefs = {str(tid): hist for tid, hist in sorted_tracks}
+                with open(video_dir / f"track_beliefs_{video_name}.json", 'w') as f:
+                    json.dump(beliefs, f, indent=2)
         
         self._reset_accumulators()
     
