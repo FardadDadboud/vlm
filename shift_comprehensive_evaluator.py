@@ -191,18 +191,24 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
         if hasattr(detector, 'reset'):
             detector.reset()
         
-        detector.set_video_name(video_id)
+        if hasattr(detector, 'set_video_name'):
+            detector.set_video_name(video_id)
         # Sort by frame number if available
         samples.sort(key=lambda x: x[1].get('frame_idx', x[0]))
         
         video_start = time.time()
+        frame_times = []
         
         for frame_idx, (dataset_idx, sample) in enumerate(samples):
             if max_samples is not None and total_processed >= max_samples:
                 break
             image_path = sample['image_path']
             image = Image.open(image_path)
+            
+            t_frame = time.perf_counter()
             detection_result = detector.adapt_and_detect(image, target_classes, threshold=threshold)
+            frame_time = time.perf_counter() - t_frame
+            frame_times.append(frame_time)
             
             pred = {
                 'image_id': sample['image_info']['id'],
@@ -215,6 +221,27 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
             predictions.append(pred)
             total_processed += 1
         
+        # Computational footprint summary
+        if frame_times:
+            import numpy as np
+            ft = np.array(frame_times)
+            fps = 1.0 / ft.mean()
+            print(f"\n── Computational Footprint ──")
+            print(f"  Frames: {len(ft)}")
+            print(f"  Mean: {ft.mean()*1000:.1f}ms | Std: {ft.std()*1000:.1f}ms")
+            print(f"  FPS: {fps:.2f}")
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    print(f"  GPU allocated: {torch.cuda.memory_allocated()/1024**2:.0f}MB")
+                    print(f"  GPU reserved: {torch.cuda.memory_reserved()/1024**2:.0f}MB")
+            except: pass
+            try:
+                import psutil
+                print(f"  RAM: {psutil.Process().memory_info().rss/1024**2:.0f}MB")
+            except: pass
+
+
         if max_samples is not None and total_processed >= max_samples:
             print(f"  Reached max_samples limit ({max_samples})")
             break

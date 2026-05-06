@@ -212,14 +212,17 @@ class OWLv2Detector(BaseDetector):
         if self.device == "cuda":
             print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    def detect(self, image: Image.Image, texts: List[str], threshold: float = 0.05) -> DetectionResult:
-    
+    def detect(self, image: Image.Image, texts: List[str], threshold: float = 0.05, iou_threshold: float = 0.3) -> DetectionResult:
+        # Signature matches GroundingDINODetector.detect so the vanilla adapter's
+        # positional call detector.detect(image, texts, threshold, iou_threshold)
+        # works for either backbone.
+
         # Store original size
         original_size = image.size
-        
+
         # Preprocess image, resize to 1024x1024
         processed_image = image.resize((1024, 1024))
-        
+
         # Process input
         inputs = self.processor(text=[texts], images=processed_image, return_tensors="pt")
 
@@ -242,25 +245,41 @@ class OWLv2Detector(BaseDetector):
             threshold=threshold
         )
 
-        # Extract and scale results back to original size
+        # Extract and scale results back to original size. HF returns labels
+        # as a tensor of integer class indices into the input `texts` list;
+        # convert to strings so the downstream evaluator's category mapping
+        # (which keys on text labels) works the same way as for GroundingDINO.
         boxes = results[0]["boxes"].cpu().numpy().tolist()
         scores = results[0]["scores"].cpu().numpy().tolist()
-        labels = results[0]["labels"] if "labels" in results[0] else [texts[0]] * len(boxes)
+        if "labels" in results[0]:
+            label_idx = results[0]["labels"].cpu().numpy().tolist()
+            labels = [texts[i] if 0 <= i < len(texts) else "unknown" for i in label_idx]
+        else:
+            labels = [texts[0]] * len(boxes)
 
-        # Scale boxes back to original image size
-        scale_x = original_size[0] / 1024  # width scaling
-        scale_y = original_size[1] / 1024  # height scaling
-        
+        # Scale boxes back to original image size and clip to image bounds
+        # (OWLv2 boxes can extend slightly outside the input rectangle).
+        scale_x = original_size[0] / 1024
+        scale_y = original_size[1] / 1024
         scaled_boxes = []
         for box in boxes:
             x1, y1, x2, y2 = box
-            scaled_box = [
-                x1 * scale_x,
-                y1 * scale_y, 
-                x2 * scale_x,
-                y2 * scale_y
-            ]
-            scaled_boxes.append(scaled_box)
+            x1 *= scale_x; x2 *= scale_x
+            y1 *= scale_y; y2 *= scale_y
+            x1 = max(0.0, min(float(original_size[0]), x1))
+            x2 = max(0.0, min(float(original_size[0]), x2))
+            y1 = max(0.0, min(float(original_size[1]), y1))
+            y2 = max(0.0, min(float(original_size[1]), y2))
+            scaled_boxes.append([x1, y1, x2, y2])
+
+        # Apply NMS so the OWLv2 vanilla path matches GroundingDINO's vanilla
+        # path (which also NMSes at iou_threshold). HF post_process_*_detection
+        # only thresholds; without NMS, OWLv2 emits many overlapping duplicates.
+        if scaled_boxes:
+            keep = self._nms_boxes(scaled_boxes, scores, iou_threshold)
+            scaled_boxes = [scaled_boxes[i] for i in keep]
+            scores = [scores[i] for i in keep]
+            labels = [labels[i] for i in keep]
 
         return DetectionResult(
             boxes=scaled_boxes,
@@ -268,6 +287,126 @@ class OWLv2Detector(BaseDetector):
             labels=labels,
             image_path="",
             model_path=self.model_path,
+        )
+
+    def detect_with_features(self, image: Image.Image, texts: List[str], threshold: float = 0.05, alpha: float = 0.7) -> DetectionResult:
+        """
+        OWLv2 counterpart of GroundingDINO's _detect_transformers_with_features.
+        Returns DetectionResult with all candidate per-patch boxes/features/probs
+        (no thresholding, no NMS — adapters do that downstream).
+
+        OWLv2 has no DETR-style decoder; per-patch class_embeds (already projected
+        into the text-prototype space) play the role of "query features", and
+        per-patch logits are softmax-normalised so class_probs lives on the simplex
+        expected by TRUST's BCA+/STAD path. Every output field listed in
+        DetectionResult is populated to match what global_instance_adapter consumes.
+        """
+        if not texts or not isinstance(texts, list):
+            return DetectionResult([], [], [], "", self.model_path)
+
+        original_size = image.size
+        processed_image = image.resize((1024, 1024))
+
+        inputs = self.processor(text=[texts], images=processed_image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            if self.device == "cuda":
+                with torch.amp.autocast('cuda'):
+                    outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
+            else:
+                outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
+
+        # Per-patch class-projected features serve as "query features": same
+        # space as text_embeds, since logits = class_embeds @ text_embeds^T.
+        if hasattr(outputs, "class_embeds") and outputs.class_embeds is not None:
+            query_features = outputs.class_embeds[0].float().cpu().numpy()
+        else:
+            query_features = outputs.image_embeds[0].float().cpu().numpy()
+
+        logits = outputs.logits[0].float().cpu().numpy()        # (num_patches, num_classes)
+        pred_boxes = outputs.pred_boxes[0].float().cpu().numpy()  # (num_patches, 4) cxcywh in [0,1]
+
+        # Per-class text prototypes (OWLv2 broadcasts text_embeds across patches,
+        # so we take the unique per-class rows).
+        if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
+            te = outputs.text_embeds[0].float().cpu().numpy()
+            num_classes = len(texts)
+            text_features = te[:num_classes] if te.shape[0] >= num_classes else te
+        else:
+            with torch.no_grad():
+                text_inputs = self.processor.tokenizer(
+                    texts, return_tensors="pt", padding=True, truncation=True
+                ).to(self.device)
+                txt_out = self.model.owlv2.text_model(**text_inputs)
+                text_features = txt_out.pooler_output.float().cpu().numpy()
+
+        # Sanitize amp/fp16 numerics
+        query_features[np.isnan(query_features)] = 0
+        query_features[np.isinf(query_features)] = 0
+        text_features = np.nan_to_num(text_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # OWLv2 is natively sigmoid-per-class; softmax-normalise across classes
+        # so class_probs lives on the simplex expected by BCA+/STAD downstream.
+        class_logits_shifted = logits - np.max(logits, axis=1, keepdims=True)
+        class_probs = np.exp(class_logits_shifted)
+        class_probs = class_probs / (np.sum(class_probs, axis=1, keepdims=True) + 1e-8)
+
+        all_scores = class_probs.max(axis=1)
+        all_label_indices = class_probs.argmax(axis=1)
+        all_labels = [texts[idx] for idx in all_label_indices]
+
+        # cxcywh @ processed-size -> xyxy @ original-size
+        proc_w, proc_h = 1024, 1024
+        cx = pred_boxes[:, 0] * proc_w
+        cy = pred_boxes[:, 1] * proc_h
+        bw = pred_boxes[:, 2] * proc_w
+        bh = pred_boxes[:, 3] * proc_h
+        boxes_xyxy_proc = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
+        scale_x = original_size[0] / proc_w
+        scale_y = original_size[1] / proc_h
+        boxes_xyxy = boxes_xyxy_proc * np.array([scale_x, scale_y, scale_x, scale_y])
+        # OWLv2's per-patch box predictor occasionally emits coordinates outside
+        # [0, W] x [0, H] (the box bias term is unbounded). Clip to image bounds
+        # so downstream geometry (Kalman scale state, IoU, NMS) is well-defined.
+        # This matches HF's post_process_grounded_object_detection clipping;
+        # degenerate boxes after clipping are discarded by the adapter's NMS.
+        boxes_xyxy[:, 0] = np.clip(boxes_xyxy[:, 0], 0.0, original_size[0])
+        boxes_xyxy[:, 2] = np.clip(boxes_xyxy[:, 2], 0.0, original_size[0])
+        boxes_xyxy[:, 1] = np.clip(boxes_xyxy[:, 1], 0.0, original_size[1])
+        boxes_xyxy[:, 3] = np.clip(boxes_xyxy[:, 3], 0.0, original_size[1])
+
+        # Hybrid features (mirror GroundingDINO path: alpha-blend raw + semantic)
+        raw_decoder_norm = query_features / (np.linalg.norm(query_features, axis=1, keepdims=True) + 1e-8)
+        if alpha > 0:
+            semantic_norm = class_probs / (np.linalg.norm(class_probs, axis=1, keepdims=True) + 1e-8)
+            hybrid_features = np.concatenate(
+                [(1 - alpha) * raw_decoder_norm, alpha * semantic_norm], axis=1
+            )
+        else:
+            hybrid_features = raw_decoder_norm
+
+        raw_text_norm = text_features / (np.linalg.norm(text_features, axis=1, keepdims=True) + 1e-8)
+        if alpha > 0:
+            one_hot = np.eye(len(texts))
+            one_hot_norm = one_hot / (np.linalg.norm(one_hot, axis=1, keepdims=True) + 1e-8)
+            hybrid_text_embeddings = np.concatenate(
+                [(1 - alpha) * raw_text_norm, alpha * one_hot_norm], axis=1
+            )
+        else:
+            hybrid_text_embeddings = raw_text_norm
+
+        return DetectionResult(
+            boxes=boxes_xyxy.tolist(),
+            scores=all_scores.tolist(),
+            labels=all_labels,
+            image_path="",
+            model_path=self.model_path,
+            features=hybrid_features,
+            class_probs=class_probs,
+            text_embeddings=hybrid_text_embeddings,
+            raw_features=raw_decoder_norm,
+            raw_text_embeddings=raw_text_norm,
         )
 
 

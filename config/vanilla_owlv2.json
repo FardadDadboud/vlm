@@ -1,0 +1,26 @@
+{
+  "_note": "Matched-protocol Vanilla baseline on OWLv2 backbone. Filters mirror global_instance_Guassian_owlv2.json so the gain claim 'TRUST-OWLv2 vs Vanilla-OWLv2' is computed under identical evaluation settings.",
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "filters": {
+    "weather": ["clear", "cloudy", "foggy", "overcast", "rainy"],
+    "time": ["daytime"],
+    "max_frames_per_video": 100
+  },
+  "max_samples": null,
+  "detector": {
+    "name": "owlv2",
+    "model_path": "google/owlv2-base-patch16-ensemble",
+    "threshold": 0.1,
+    "iou_threshold": 0.7,
+    "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"]
+  },
+  "adaptation": {
+    "type": "none",
+    "params": {}
+  },
+  "output_dir": "./shift_vanilla_owlv2_results",
+  "num_visualizations": 1000,
+  "reset_on_video_change": true,
+  "process_by_video": true
+}
