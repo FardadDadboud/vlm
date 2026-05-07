@@ -10,6 +10,7 @@ Available adapters:
 from .base_adapter import BaseAdapter
 from .vanilla_adapter import VanillaAdapter
 from .bca_plus_adapter import BCAPlusAdapter
+from .tent_adapter import TENTAdapter
 from .base_adapter import BaseAdapter
 # Import from track.py (single file with all tracking components)
 from .track import (
@@ -100,9 +101,12 @@ def create_adapter(adaptation_type: str, detector, config: dict) -> BaseAdapter:
 
     elif adaptation_type == 'global_instance':
         return GlobalInstanceAdapter(detector, config)
+
+    elif adaptation_type == 'tent':
+        return TENTAdapter(detector, config)
     else:
         raise ValueError(f"Unknown adaptation type: {adaptation_type}. "
-                        f"Available: none, vanilla, bca_plus, temporal, global_instance")
+                        f"Available: none, vanilla, bca_plus, temporal, global_instance, tent")
 
 
 def list_adapters() -> dict:
@@ -112,15 +116,17 @@ def list_adapters() -> dict:
         'vanilla': {'available': True, 'description': 'No adaptation, passthrough'},
         'bca_plus': {'available': True, 'description': 'BCA+ Bayesian Class Adaptation'},
         'temporal': {'available': TEMPORAL_AVAILABLE, 'description': 'STAD temporal adaptation'},
-        'global_instance': {'available': True, 'description': 'Global + Instance Temporal BCA+'}
+        'global_instance': {'available': True, 'description': 'Global + Instance Temporal BCA+'},
+        'tent': {'available': True, 'description': 'TENT (gradient-based TTA via LayerNorm entropy minimisation)'},
     }
     return adapters
 
 
 __all__ = [
     'BaseAdapter',
-    'VanillaAdapter', 
+    'VanillaAdapter',
     'BCAPlusAdapter',
+    'TENTAdapter',
     'create_adapter',
     'list_adapters'
 ]

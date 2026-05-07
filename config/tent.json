@@ -1,0 +1,33 @@
+{
+  "_note": "TENT (Wang et al., ICLR 2021) on GroundingDINO. Gradient-based TTA via entropy minimisation on LayerNorm gamma/beta. Filters and detector model match the headline GD configs so the comparison against vanilla / BCA+ / STAD / TRUST is matched-protocol.",
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "filters": {
+    "weather": ["clear", "cloudy", "foggy", "overcast", "rainy"],
+    "time": ["daytime"],
+    "max_frames_per_video": 100
+  },
+  "max_samples": null,
+  "detector": {
+    "name": "grounding-dino",
+    "model_path": "IDEA-Research/grounding-dino-base",
+    "threshold": 0.1,
+    "iou_threshold": 0.7,
+    "target_classes": ["pedestrian", "car", "truck", "bus", "motorcycle", "bicycle"]
+  },
+  "adaptation": {
+    "type": "tent",
+    "params": {
+      "_comment_lr": "Standard TENT lr; back off to 1e-4 if entropy collapses on long streams.",
+      "lr": 1e-5,
+      "betas": [0.9, 0.999],
+      "weight_decay": 0.0,
+      "grad_clip": 1.0,
+      "use_amp": true
+    }
+  },
+  "output_dir": "./shift_tent_results",
+  "num_visualizations": 1000,
+  "reset_on_video_change": true,
+  "process_by_video": true
+}
