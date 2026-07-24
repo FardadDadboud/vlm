@@ -2,7 +2,7 @@
   "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
   "split": "val",
   "filters": {
-    "weather": ["clear"],
+    "weather": ["clear", "cloudy", "foggy", "overcast", "rainy"],
     "time": ["daytime"],
     "max_frames_per_video": null
   },
@@ -27,5 +27,7 @@
     }
   },
   "output_dir": "./shift_bca_plus_results",
-  "num_visualizations": 1000
+  "num_visualizations": 1000,
+  "reset_on_video_change": true,
+  "process_by_video": true
 }

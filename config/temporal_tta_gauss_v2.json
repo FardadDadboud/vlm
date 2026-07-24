@@ -6,7 +6,7 @@
   "output_dir": "./shift_temporal_tta_gaussian_results",
   
   "filters": {
-      "weather": ["clear"],
+      "weather": ["clear", "cloudy", "foggy", "overcast", "rainy"],
       "time": ["daytime"],
       "max_frames_per_video": null
   },
@@ -52,7 +52,7 @@
           "dirichlet_alpha": 0.01,
           
           "_comment_debug": "Debug mode and debug every n frames",
-          "debug": true,
+          "debug": false,
           "debug_every": 30
       }
   },
