@@ -18,4 +18,11 @@ class VanillaAdapter(BaseAdapter):
         """
         Run vanilla detection without any adaptation
         """
-        return self.detector.detect(image, target_classes, threshold, self.iou_threshold)
+        result = self.detector.detect(image, target_classes, threshold, self.iou_threshold)
+        # T0b (rebuttal): OUTPUT-ONLY. No adaptation is applied, so the raw VLM
+        # probabilities ARE the reported probabilities; there is no tracking.
+        if hasattr(result, 'raw_class_probs'):
+            result.raw_class_probs = result.class_probs
+            result.track_ids = None
+            result.track_hits = None
+        return result

@@ -69,6 +69,11 @@ class DetectionResult:
     text_embeddings: Optional[np.ndarray] = None    # Hybrid 262D
     raw_features: Optional[np.ndarray] = None       # Raw 256D (NEW)
     raw_text_embeddings: Optional[np.ndarray] = None  # Raw 256D (NEW)
+    # T0b (rebuttal instrumentation): OUTPUT-ONLY optional fields, default None.
+    # Never consumed by adaptation; used only for downstream ECE/NLL/track analysis.
+    raw_class_probs: Optional[list] = None          # pre-adaptation VLM probs, per detection
+    track_ids: Optional[list] = None                # per-detection track id, -1 if untracked
+    track_hits: Optional[list] = None               # per-detection track maturity (hits), 0 if untracked
 
 
 class BaseDetector(ABC):
@@ -479,6 +484,7 @@ class GroundingDINODetector(BaseDetector):
                 boxes_list = boxes.cpu().numpy().tolist()
                 scores_list = logits.cpu().numpy().tolist()
                 labels_list = phrases
+                probs_list = None  # T0b: custom-GDINO path exposes no per-class probs
 
             else:  # Transformers - use manual model forward pass with offset-span aggregation
                 model = self.model.model
@@ -565,13 +571,17 @@ class GroundingDINODetector(BaseDetector):
                 boxes_list = all_boxes_xyxy[mask].tolist()
                 scores_list = all_scores[mask].tolist()
                 labels_list = [all_labels[i] for i, m in enumerate(mask) if m]
-                
+                # T0b: carry per-detection probs through the SAME mask+NMS transforms
+                # as boxes_list so class_probs stays index-aligned with the output.
+                probs_list = class_probs[mask].tolist()
+
                 # Apply NMS to remove overlapping boxes
                 if boxes_list:
                     keep_indices = self._nms_boxes(boxes_list, scores_list, iou_threshold=iou_threshold)
                     boxes_list = [boxes_list[i] for i in keep_indices]
                     scores_list = [scores_list[i] for i in keep_indices]
                     labels_list = [labels_list[i] for i in keep_indices]
+                    probs_list = [probs_list[i] for i in keep_indices]
 
         except Exception as e:
             print(f"GroundingDINO detection error: {e}")
@@ -582,7 +592,8 @@ class GroundingDINODetector(BaseDetector):
             scores=scores_list,
             labels=labels_list,
             image_path="",
-            model_path=self.model_path
+            model_path=self.model_path,
+            class_probs=probs_list  # T0b: aligned per-detection VLM probs (output-only)
         )
 
     def detect_with_features(self, image: Image.Image, texts: List[str], threshold: float = 0.05, alpha: float = 0.7) -> DetectionResult:

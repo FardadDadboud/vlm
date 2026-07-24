@@ -1434,7 +1434,34 @@ class GlobalInstanceAdapter(BaseAdapter):
             features=nms_features,
             track_ids=track_ids
         )
-        
+
+        # === T0b (rebuttal): attach OUTPUT-ONLY serialization fields ===
+        # Purely additive. NOT consumed by STAD, the cache, or any adaptation
+        # path; used only for downstream ECE/NLL/track analysis.
+        # Alignment: real post-NMS detections occupy output indices
+        # [0, len(nms_raw_probs)) in the SAME order as nms_boxes/final_probs
+        # (all sliced by nms_indices, never reordered). Any phantom detections
+        # (use_predicted_for_missed) are appended AFTER and carry no raw VLM prob.
+        try:
+            _n_out = len(track_ids)
+            _n_real = len(nms_raw_probs)
+            _raw_out = [np.asarray(nms_raw_probs[i]).tolist() for i in range(_n_real)]
+            if _n_out > _n_real:                       # phantom tail: no raw VLM prob
+                _raw_out += [None] * (_n_out - _n_real)
+            _hits_by_id = ({t.track_id: int(t.hits)
+                            for t in self.track_manager.get_active_tracks()}
+                           if self.track_manager is not None else {})
+            _hits_out = [_hits_by_id.get(int(tid), 0) if int(tid) >= 0 else 0
+                         for tid in track_ids]
+            if hasattr(result, 'raw_class_probs'):
+                result.raw_class_probs = _raw_out
+            if hasattr(result, 'track_ids'):
+                result.track_ids = list(track_ids)
+            if hasattr(result, 'track_hits'):
+                result.track_hits = _hits_out
+        except Exception as _e:
+            print(f"[T0b] optional-field attach skipped (output-only, non-fatal): {_e}")
+
         self.frame_count += 1
         self.total_detections += N
         self.total_adapted += N_nms

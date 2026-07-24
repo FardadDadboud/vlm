@@ -31,10 +31,14 @@ class VLMSHIFTDomainEvaluator:
     Groups GT and predictions by domain (weather × time) and evaluates separately
     """
     
-    def __init__(self, dataset, output_dir: str = "./shift_evaluation_results"):
+    def __init__(self, dataset, output_dir: str = "./shift_evaluation_results",
+                 save_coco_gt: bool = False):
         self.dataset = dataset
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # T0b (rebuttal): when True, persist per-domain COCO GT alongside the
+        # temp file used for scoring (the temp file is still unlinked as before).
+        self.save_coco_gt = save_coco_gt
         
         # Domain configuration - SHIFT has weather × time combinations
         self.weather_types = ["clear", "overcast", "rainy", "foggy", "cloudy"]
@@ -282,7 +286,15 @@ class VLMSHIFTDomainEvaluator:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(coco_gt, f)
             gt_file = f.name
-        
+
+        # T0b (rebuttal): optionally persist a copy of the COCO GT for this domain.
+        # This file is NOT the temp file and is never unlinked below.
+        if getattr(self, 'save_coco_gt', False):
+            safe_domain = domain_name.replace('/', '-')
+            gt_persist = self.output_dir / f"coco_gt_{safe_domain}.json"
+            with open(gt_persist, 'w') as gf:
+                json.dump(coco_gt, gf)
+
         try:
             # Load COCO GT
             coco = COCO(gt_file)

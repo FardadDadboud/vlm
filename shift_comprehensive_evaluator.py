@@ -28,7 +28,34 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return config
 
 
-def run_detector_on_dataset(detector, dataset, config: Dict[str, Any], 
+def _attach_optional_fields(pred: dict, detection_result, save_class_probs: bool) -> None:
+    """T0b (rebuttal): OUTPUT-ONLY. When save_class_probs is set, append the
+    post-adaptation probs, pre-adaptation (raw) probs, and per-detection track
+    id / maturity to a prediction record. Probabilities are rounded to 5 dp.
+    A field is emitted only when present (not None). Emits nothing when the flag
+    is off, so default behaviour is byte-for-byte unchanged. Used by both the
+    per-video and frame-by-frame serialization sites so they behave identically."""
+    if not save_class_probs:
+        return
+
+    def _round_vec(v):
+        return None if v is None else [round(float(x), 5) for x in v]
+
+    cp = getattr(detection_result, 'class_probs', None)
+    if cp is not None:
+        pred['class_probs'] = [_round_vec(v) for v in cp]
+    rcp = getattr(detection_result, 'raw_class_probs', None)
+    if rcp is not None:
+        pred['raw_class_probs'] = [_round_vec(v) for v in rcp]
+    tid = getattr(detection_result, 'track_ids', None)
+    if tid is not None:
+        pred['track_ids'] = [int(t) for t in tid]
+    th = getattr(detection_result, 'track_hits', None)
+    if th is not None:
+        pred['track_hits'] = [int(h) for h in th]
+
+
+def run_detector_on_dataset(detector, dataset, config: Dict[str, Any],
                             output_dir: Path,
                             max_samples: int = None):
     """
@@ -111,6 +138,7 @@ def run_detector_on_dataset(detector, dataset, config: Dict[str, Any],
             'scores': [float(s) for s in detection_result.scores],
             'labels': [str(l) for l in detection_result.labels]
         }
+        _attach_optional_fields(pred, detection_result, config.get('save_class_probs', False))
         predictions.append(pred)
         
         # Progress logging
@@ -148,7 +176,11 @@ def run_detector_on_dataset(detector, dataset, config: Dict[str, Any],
     # Save predictions
     pred_file = output_dir / "predictions.json"
     with open(pred_file, 'w') as f:
-        json.dump(predictions, f, indent=2)
+        # T0b: compact dump when probs are serialized (size measure), else unchanged.
+        if config.get('save_class_probs', False):
+            json.dump(predictions, f, separators=(',', ':'))
+        else:
+            json.dump(predictions, f, indent=2)
     print(f"✓ Predictions saved to: {pred_file}")
     
     return predictions
@@ -218,6 +250,7 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
                 'video_id': video_id,
                 'frame_idx': frame_idx
             }
+            _attach_optional_fields(pred, detection_result, config.get('save_class_probs', False))
             predictions.append(pred)
             total_processed += 1
         
@@ -262,7 +295,11 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
     # Save predictions
     pred_file = output_dir / "predictions.json"
     with open(pred_file, 'w') as f:
-        json.dump(predictions, f, indent=2)
+        # T0b: compact dump when probs are serialized (size measure), else unchanged.
+        if config.get('save_class_probs', False):
+            json.dump(predictions, f, separators=(',', ':'))
+        else:
+            json.dump(predictions, f, indent=2)
     print(f"✓ Predictions saved to: {pred_file}")
     
     return predictions
@@ -386,7 +423,8 @@ def main():
     
     evaluator = VLMSHIFTDomainEvaluator(
         dataset=dataset,
-        output_dir=str(output_dir)
+        output_dir=str(output_dir),
+        save_coco_gt=CONFIG.get('save_coco_gt', False)
     )
     
     results = evaluator.evaluate_detections(
