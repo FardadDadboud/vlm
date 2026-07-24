@@ -1,0 +1,44 @@
+{
+  "data_root": "/media/fardad/T7 Touch/SHIFT/shift-dev/data",
+  "split": "val",
+  "output_dir": "./rebuttal_runs/rb_vanilla_dawndusk",
+  "filters": {
+    "weather": [
+      "clear",
+      "cloudy",
+      "foggy",
+      "overcast",
+      "rainy"
+    ],
+    "time": [
+      "dawn/dusk"
+    ],
+    "max_frames_per_video": null
+  },
+  "max_samples": null,
+  "num_visualizations": 0,
+  "save_class_probs": true,
+  "save_coco_gt": true,
+  "diagnostics": true,
+  "detector": {
+    "name": "grounding-dino",
+    "model_path": "IDEA-Research/grounding-dino-base",
+    "target_classes": [
+      "pedestrian",
+      "car",
+      "truck",
+      "bus",
+      "motorcycle",
+      "bicycle"
+    ],
+    "threshold": 0.1,
+    "iou_threshold": 0.7
+  },
+  "reset_on_video_change": true,
+  "process_by_video": true,
+  "_note": "T0b rebuttal: 13-condition (daytime+night+dawn/dusk) matched-protocol vanilla, prob+GT dump ON.",
+  "adaptation": {
+    "type": "none",
+    "params": {}
+  }
+}
