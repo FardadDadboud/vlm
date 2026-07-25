@@ -554,6 +554,11 @@ class GlobalInstanceAdapter(BaseAdapter):
         # vanilla's gating. Cache/STAD already update pre-modulation, so this trims
         # only the reported set (invariants preserved).
         self.regate_after_modulation = params.get('regate_after_modulation', False)
+        # Common-class fusion gate (default OFF): when the RAW VLM argmax and the
+        # FUSED argmax are BOTH common classes and disagree, defer to the VLM.
+        # Never fires if either argmax is a rare class -> protects rare recovery.
+        self.common_class_gate = params.get('common_class_gate', False)
+        self._common_classes = set(params.get('common_classes', [0, 1, 2]))  # ped, car, truck
 
         # Temporal score smoothing (optional: smooth score with track history)
         self.use_temporal_score_smoothing = params.get('use_temporal_score_smoothing', False)
@@ -1297,6 +1302,21 @@ class GlobalInstanceAdapter(BaseAdapter):
         #         score_mod_stats['stad_scores_applied'] = sum(1 for tid in track_ids if tid >= 0)
         #     else:
         #         final_scores = nms_scores  # No modulation, keep original VLM scores
+
+        # ===== Common-class fusion gate (default OFF) =====
+        # Gates ONLY the final fusion combination. Cache/STAD updates above already
+        # consumed RAW probs (Stage 8), so invariant 3 is unaffected.
+        if self.common_class_gate and N_nms > 0:
+            raw_arg = np.argmax(nms_raw_probs, axis=1)
+            fused_arg = np.argmax(final_probs, axis=1)
+            n_gated = 0
+            for i in range(N_nms):
+                if (raw_arg[i] != fused_arg[i]
+                        and raw_arg[i] in self._common_classes
+                        and fused_arg[i] in self._common_classes):
+                    final_probs[i] = nms_raw_probs[i]   # defer to VLM
+                    n_gated += 1
+            dbg['common_gate_fired'] = n_gated
 
         # ===== Stage 10: Final Score Computation =====
         final_scores = nms_scores.copy()
