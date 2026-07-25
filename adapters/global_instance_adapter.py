@@ -549,7 +549,12 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.tentative_track_penalty = params.get('tentative_track_penalty', 0.0)  # Subtract from tentative (0 = no penalty)
         self.untracked_penalty = params.get('untracked_penalty', 0.05)  # Subtract from untracked detections
         self.filter_untracked = params.get('filter_untracked', False)  # If True, remove untracked detections entirely
-        
+        # Structural fix (default OFF): after score modulation, re-apply the detector
+        # threshold so no OUTPUT detection sits below detector.threshold — matching
+        # vanilla's gating. Cache/STAD already update pre-modulation, so this trims
+        # only the reported set (invariants preserved).
+        self.regate_after_modulation = params.get('regate_after_modulation', False)
+
         # Temporal score smoothing (optional: smooth score with track history)
         self.use_temporal_score_smoothing = params.get('use_temporal_score_smoothing', False)
         self.score_smoothing_alpha = params.get('score_smoothing_alpha', 0.3)  # EMA weight for history
@@ -1327,7 +1332,25 @@ class GlobalInstanceAdapter(BaseAdapter):
                     final_scores[i] = max(0.0, final_scores[i] - self.untracked_penalty)
         
         dbg['score_mod'] = score_mod_stats
-        
+
+        # ===== Re-gate after modulation (structural FP-flood fix, default OFF) =====
+        # Modulation (blend / untracked_penalty above) can push a score below the
+        # detector threshold; without re-gating those survive in the output (min
+        # reported score < threshold), unlike vanilla which re-thresholds. Trim them.
+        if self.regate_after_modulation and N_nms > 0:
+            gate = final_scores >= threshold
+            if not gate.all():
+                keep = np.where(gate)[0]
+                nms_boxes     = nms_boxes[keep]
+                final_scores  = final_scores[keep]
+                final_probs   = final_probs[keep]
+                nms_features  = nms_features[keep]
+                nms_raw_probs = nms_raw_probs[keep]
+                nms_labels    = [nms_labels[i] for i in keep]
+                track_ids     = [track_ids[i] for i in keep]
+                N_nms         = len(keep)
+                dbg['N_regated'] = int(N_nms)
+
         # ===== Stage 11: Phantom Detections for Unmatched Tracks =====
         # Output predicted boxes for tracks that weren't matched (missed detections)
         phantom_stats = {'added': 0, 'skipped_score': 0, 'skipped_frames': 0}
