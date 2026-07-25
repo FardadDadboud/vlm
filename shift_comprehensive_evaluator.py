@@ -17,7 +17,7 @@ import time
 # Import components
 from vlm_shift_dataset import VLMSHIFTDataset
 from vlm_shift_domain_evaluator import VLMSHIFTDomainEvaluator
-from vlm_detector_system_new import OWLv2Detector, GroundingDINODetector, check_gpu_status
+from vlm_detector_system_new import OWLv2Detector, GroundingDINODetector, YOLOWorldDetector, check_gpu_status
 from adapters import create_adapter
 
 
@@ -372,6 +372,11 @@ def main():
         )
     elif CONFIG['detector']['name'] == 'grounding-dino':
         base_detector = GroundingDINODetector(
+            model_path=CONFIG['detector']['model_path'],
+            device=device
+        )
+    elif CONFIG['detector']['name'] == 'yolo-world':
+        base_detector = YOLOWorldDetector(
             model_path=CONFIG['detector']['model_path'],
             device=device
         )

@@ -1081,7 +1081,9 @@ class YOLOWorldDetector(BaseDetector):
 
         print(f"✓ YOLO-World loaded on {self.device}")
 
-    def detect(self, image: Image.Image, texts: List[str], threshold: float = 0.05) -> DetectionResult:
+    def detect(self, image: Image.Image, texts: List[str], threshold: float = 0.05, iou_threshold: float = 0.7) -> DetectionResult:
+        # Signature matches OWLv2/GroundingDINO detect() so the vanilla adapter's
+        # positional call detector.detect(image, texts, threshold, iou_threshold) works.
         # Only set classes if they've changed (expensive operation)
         if not self.classes_set or self.last_texts != texts:
             try:
@@ -1110,6 +1112,7 @@ class YOLOWorldDetector(BaseDetector):
         results = self.model(
             image_np,
             conf=threshold,
+            iou=iou_threshold,
             verbose=False,
             device=self.device,
             half=False  # Disable FP16 to avoid CLIP model issues
