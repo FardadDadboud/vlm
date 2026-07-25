@@ -351,14 +351,19 @@ class OWLv2Detector(BaseDetector):
         query_features[np.isinf(query_features)] = 0
         text_features = np.nan_to_num(text_features, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # OWLv2 is natively sigmoid-per-class; softmax-normalise across classes
-        # so class_probs lives on the simplex expected by BCA+/STAD downstream.
+        # OWLv2 is natively sigmoid-per-class. Two DISTINCT quantities:
+        #  - SCORE/threshold decision uses the native per-class SIGMOID confidence
+        #    (matches vanilla detect()'s HF post_process_grounded_object_detection;
+        #    NOT softmax-max, whose 1/K floor made the adapter's threshold a no-op).
+        #  - class_probs stays a softmax SIMPLEX (sums to 1) for BCA+/STAD downstream.
+        sigmoid_scores = 1.0 / (1.0 + np.exp(-np.clip(logits, -30.0, 30.0)))  # (P, K)
+
         class_logits_shifted = logits - np.max(logits, axis=1, keepdims=True)
         class_probs = np.exp(class_logits_shifted)
         class_probs = class_probs / (np.sum(class_probs, axis=1, keepdims=True) + 1e-8)
 
-        all_scores = class_probs.max(axis=1)
-        all_label_indices = class_probs.argmax(axis=1)
+        all_scores = sigmoid_scores.max(axis=1)            # native OWLv2 confidence
+        all_label_indices = sigmoid_scores.argmax(axis=1)  # == softmax/logit argmax
         all_labels = [texts[idx] for idx in all_label_indices]
 
         # cxcywh @ processed-size -> xyxy @ original-size
