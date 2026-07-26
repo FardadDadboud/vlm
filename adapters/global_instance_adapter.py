@@ -570,6 +570,12 @@ class GlobalInstanceAdapter(BaseAdapter):
         self.owlv2_native_sigmoid_probs = params.get('owlv2_native_sigmoid_probs', False)
         if hasattr(self.detector, 'native_sigmoid_probs'):
             self.detector.native_sigmoid_probs = self.owlv2_native_sigmoid_probs
+        # Health-gate the UNTRACKED final_probs path (default OFF): the cache-readiness
+        # signal already gates the score path but never final_probs, so an unhealthy
+        # cache still relabels untracked detections. When ON: for untracked detections,
+        # if the cache is NOT ready, keep the RAW VLM probs (no cache relabel). Uses the
+        # SAME cache_ready signal already computed; no new threshold. Detector-agnostic.
+        self.health_gate_untracked = params.get('health_gate_untracked', False)
         # Common-class fusion gate (default OFF): when the RAW VLM argmax and the
         # FUSED argmax are BOTH common classes and disagree, defer to the VLM.
         # Never fires if either argmax is a rare class -> protects rare recovery.
@@ -928,6 +934,7 @@ class GlobalInstanceAdapter(BaseAdapter):
         #     global_adapted_probs = class_probs.copy()
         #     dbg['used_adapted_scores'] = False
         # ===== Stage 3: Global BCA+ Adaptation =====
+        cache_ready = False  # always defined (set True below only when cache is healthy)
         if self.use_global_cache and self.global_cache is not None:
             global_adapted_probs, cache_posteriors = self.global_cache.adapt_probs_batch(
                 features, boxes, class_probs, return_posteriors=True
@@ -1318,6 +1325,20 @@ class GlobalInstanceAdapter(BaseAdapter):
         #         score_mod_stats['stad_scores_applied'] = sum(1 for tid in track_ids if tid >= 0)
         #     else:
         #         final_scores = nms_scores  # No modulation, keep original VLM scores
+
+        # ===== Health-gate untracked final_probs (default OFF) =====
+        # The cache-readiness signal already gates the score path (Stage 3) but NOT
+        # final_probs. When the cache is NOT ready, an unhealthy/dominated cache still
+        # relabels UNTRACKED detections (final_probs = p_global). Mirror the score path:
+        # keep RAW VLM probs for untracked detections when the cache is not ready.
+        # Cache/STAD updates already consumed RAW probs (Stage 8), so invariant 3 holds.
+        if self.health_gate_untracked and N_nms > 0 and not cache_ready:
+            n_hgated = 0
+            for i in range(N_nms):
+                if track_ids[i] < 0:  # untracked -> final_probs is pure p_global
+                    final_probs[i] = nms_raw_probs[i]
+                    n_hgated += 1
+            dbg['health_gate_untracked_fired'] = n_hgated
 
         # ===== Common-class fusion gate (default OFF) =====
         # Gates ONLY the final fusion combination. Cache/STAD updates above already
