@@ -1,0 +1,48 @@
+{
+  "_purpose": "SINGLE-CONFIG JOINT grid search. Selection metric is POOLED mAP@50 across ALL 13 conditions (results['overall']['mAP_50'] over the all-13 filter), applied UNIFORMLY. NEVER per-domain best-of. Supports the held-out single-config rebuttal claim.",
+  "_pooled_metric_note": "grid_search_runner.run_single_experiment returns results['overall']['mAP_50']; with the all-13 dataset_subset.filters below, 'overall' IS the pooled-over-13 COCO metric. No runner change needed.",
+  "_base_config_override_warning": "config/global_instance_Guassian.json ships with detector.threshold=0.75 and iou_threshold=0.1 (WRONG vs the paper operating point). This grid PINS detector.threshold=0.1 and detector.iou_threshold=0.7 via single-value grid_params so the search runs at the paper operating point. Do NOT remove these two entries.",
+  "_stack_note": "MUST run under the pinned transformers==4.57.6 venv (slow image processor). A 5.x run is worthless. See build_narval_env.sh + narval_grid_search.sbatch.",
+
+  "base_config_path": "config/global_instance_Guassian.json",
+
+  "grid_params": {
+    "adaptation.params.tau1":                        [0.7, 0.8, 0.9],
+    "adaptation.params.alpha":                       [0.15, 0.3, 0.45],
+    "adaptation.params.score_blend_lambda":          [0.5, 0.7],
+    "adaptation.params.tau2":                        [0.8, 0.9],
+    "adaptation.params.q_scale":                     [0.03, 0.05],
+    "adaptation.params.r_base":                      [0.3, 0.4],
+    "adaptation.params.track_creation_threshold":    [0.65, 0.75],
+    "adaptation.params.track_creation_threshold_weak":[0.35, 0.45],
+
+    "detector.threshold":     [0.1],
+    "detector.iou_threshold": [0.7]
+  },
+
+  "_grid_design": {
+    "swept_params": 8,
+    "three_value_params_by_T5_eta2": ["adaptation.params.tau1 (eta2=0.496)", "adaptation.params.alpha (eta2=0.093)"],
+    "two_value_params": ["score_blend_lambda (0.040)", "tau2 (0.034)", "track_creation_threshold (0.042)", "track_creation_threshold_weak (unranked/low)", "r_base (0.003)", "q_scale (0.001)"],
+    "current_frozen_value_is_in_every_set": true,
+    "combos": "3*3*2*2*2*2*2*2 = 576  (detector overrides are single-value, x1)",
+    "pinned_overrides_not_swept": ["detector.threshold=0.1", "detector.iou_threshold=0.7"]
+  },
+
+  "execution": {
+    "gpu_memory_per_job_gb": 8.0,
+    "safety_margin_gb": 4.0,
+    "checkpoint_frequency": 10
+  },
+
+  "dataset_subset": {
+    "filters": {
+      "weather": ["clear", "cloudy", "foggy", "overcast", "rainy"],
+      "time": ["daytime", "night", "dawn/dusk"],
+      "max_frames_per_video": 200
+    },
+    "max_samples": null
+  },
+
+  "output_dir": "./shift_TRUST_pooled13_grid_search_results"
+}
