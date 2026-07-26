@@ -554,6 +554,22 @@ class GlobalInstanceAdapter(BaseAdapter):
         # vanilla's gating. Cache/STAD already update pre-modulation, so this trims
         # only the reported set (invariants preserved).
         self.regate_after_modulation = params.get('regate_after_modulation', False)
+        # Dense-detector native candidate selection (default OFF): have the detector's
+        # feature path return its native sparse candidate set (threshold + NMS) instead
+        # of all raw patches/anchors, so a dense detector (OWLv2/YOLO-World) presents a
+        # G-DINO-like sparse set to the adapter. Applied via a detector attribute so the
+        # G-DINO path is untouched (it simply never reads it).
+        self.native_candidate_selection = params.get('native_candidate_selection', False)
+        if hasattr(self.detector, 'native_selection'):
+            self.detector.native_selection = self.native_candidate_selection
+            self.detector.native_selection_threshold = self.detection_threshold
+            if hasattr(self.detector, 'native_selection_iou'):
+                self.detector.native_selection_iou = params.get('nms_threshold', params.get('iou_threshold', 0.7))
+        # A/B lever: peak OWLv2's class_probs (native sigmoid) instead of softmax.
+        # OWLv2 path only (G-DINO detector has no such attribute).
+        self.owlv2_native_sigmoid_probs = params.get('owlv2_native_sigmoid_probs', False)
+        if hasattr(self.detector, 'native_sigmoid_probs'):
+            self.detector.native_sigmoid_probs = self.owlv2_native_sigmoid_probs
         # Common-class fusion gate (default OFF): when the RAW VLM argmax and the
         # FUSED argmax are BOTH common classes and disagree, defer to the VLM.
         # Never fires if either argmax is a rare class -> protects rare recovery.

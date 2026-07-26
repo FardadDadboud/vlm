@@ -193,6 +193,15 @@ class OWLv2Detector(BaseDetector):
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         self.processor = None
         self.model = None
+        # Set by the adapter (native_candidate_selection flag, default off): when True,
+        # detect_with_features returns only the native-selected sparse candidate set
+        # (sigmoid threshold + NMS) instead of all ~3600 dense patches.
+        self.native_selection = False
+        self.native_selection_iou = 0.7
+        self.native_selection_threshold = 0.1
+        # A/B lever (set by adapter, default off): build class_probs from native
+        # per-class sigmoid (peaked) instead of softmax-over-logits (flatter).
+        self.native_sigmoid_probs = False
         self.load_model()
 
     def load_model(self):
@@ -358,9 +367,17 @@ class OWLv2Detector(BaseDetector):
         #  - class_probs stays a softmax SIMPLEX (sums to 1) for BCA+/STAD downstream.
         sigmoid_scores = 1.0 / (1.0 + np.exp(-np.clip(logits, -30.0, 30.0)))  # (P, K)
 
-        class_logits_shifted = logits - np.max(logits, axis=1, keepdims=True)
-        class_probs = np.exp(class_logits_shifted)
-        class_probs = class_probs / (np.sum(class_probs, axis=1, keepdims=True) + 1e-8)
+        if getattr(self, 'native_sigmoid_probs', False):
+            # A/B lever (default OFF): build class_probs from the native per-class
+            # SIGMOID normalised to a simplex, instead of softmax-over-logits. This
+            # is PEAKED (a strong single-class match -> ~0.9) vs softmax's flatter
+            # spread, raising exp(-H_vlm) so the VLM carries more weight in the
+            # cache's entropy-weighted fusion. OWLv2 path only.
+            class_probs = sigmoid_scores / (np.sum(sigmoid_scores, axis=1, keepdims=True) + 1e-8)
+        else:
+            class_logits_shifted = logits - np.max(logits, axis=1, keepdims=True)
+            class_probs = np.exp(class_logits_shifted)
+            class_probs = class_probs / (np.sum(class_probs, axis=1, keepdims=True) + 1e-8)
 
         all_scores = sigmoid_scores.max(axis=1)            # native OWLv2 confidence
         all_label_indices = sigmoid_scores.argmax(axis=1)  # == softmax/logit argmax
@@ -405,6 +422,31 @@ class OWLv2Detector(BaseDetector):
             )
         else:
             hybrid_text_embeddings = raw_text_norm
+
+        # Native candidate selection (default OFF): reduce the ~3600 dense patches to
+        # the detector's native sparse candidate set BEFORE handing them to the adapter
+        # (mirrors vanilla detect(): sigmoid threshold + class-agnostic NMS). Each kept
+        # per-anchor embedding travels WITH its surviving box, so the cache/STAD contract
+        # (embedding aligned to the kept candidate) holds. Prevents the dense-grid flood
+        # when the adapter later re-scores with softmax-simplex-max.
+        if getattr(self, 'native_selection', False):
+            # Use the detector confidence threshold passed to this call (matches
+            # vanilla detect()'s post_process(threshold=...)), NOT the adapter's
+            # higher cache/adaptation gating threshold.
+            thr = threshold
+            iou = getattr(self, 'native_selection_iou', 0.7)
+            keep = np.where(all_scores >= thr)[0]
+            if len(keep) > 0:
+                nk = self._nms_boxes(boxes_xyxy[keep].tolist(), all_scores[keep].tolist(), iou)
+                sel = keep[np.asarray(nk, dtype=int)]
+            else:
+                sel = keep
+            boxes_xyxy = boxes_xyxy[sel]
+            all_scores = all_scores[sel]
+            all_labels = [all_labels[i] for i in sel]
+            hybrid_features = hybrid_features[sel]
+            class_probs = class_probs[sel]
+            raw_decoder_norm = raw_decoder_norm[sel]
 
         return DetectionResult(
             boxes=boxes_xyxy.tolist(),
