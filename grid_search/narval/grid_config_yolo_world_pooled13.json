@@ -1,0 +1,41 @@
+{
+  "_purpose": "YOLO-World single-config JOINT grid, pooled mAP@50 over all 13 conditions. CHARACTERIZATION of SATURATION, not an expected win: YOLO-World-TRUST is already ~+0.02 over its vanilla and its cache is reliable (margin correct), so cache-admission tuning adds little. The ONLY headroom is RANKING, so this grid centers on score-modulation / track params (score_blend_lambda, confirmed_track_boost, untracked_penalty, track_creation_threshold). Expectation: FLAT. Grid is deliberately SMALL (54 combos) to confirm the ceiling, not chase it.",
+  "_runner": "MUST be run with grid_search/narval/grid_search_runner_multidet.py (stock runner hardcodes GroundingDINODetector). YOLO-World needs ultralytics installed in the pinned venv.",
+  "_stack": "PINNED transformers==4.57.6 (+ ultralytics). Fixed: native_candidate_selection=true, health_gate_untracked=true, detector.threshold=0.1, iou=0.7. data_root + detector.model_path injected at run time by the sbatch (top-level).",
+
+  "base_config_path": "rebuttal_runs/pinned/configs/yw_off_daytime.json",
+
+  "grid_params": {
+    "adaptation.params.score_blend_lambda":       [0.3, 0.5, 0.7],
+    "adaptation.params.confirmed_track_boost":    [0.05, 0.07, 0.10],
+    "adaptation.params.untracked_penalty":        [0.0, 0.01, 0.02],
+    "adaptation.params.track_creation_threshold": [0.65, 0.75],
+
+    "adaptation.params.native_candidate_selection": [true],
+    "adaptation.params.health_gate_untracked":      [true],
+    "detector.threshold":                           [0.1],
+    "detector.iou_threshold":                       [0.7],
+    "save_class_probs":                             [false]
+  },
+
+  "_grid_design": {
+    "swept": 4,
+    "combos": "3*3*3*2 = 54  (fixed overrides single-value, x1)",
+    "current_value_in_every_set": "score_blend_lambda=0.5, boost=0.07, untracked_penalty=0.01, tcr=0.65 all present -> frozen config is in the grid",
+    "chunk_axis": "adaptation.params.score_blend_lambda (first swept param, length 3) -> 3 array chunks x 18 configs",
+    "expectation": "flat / saturation; ranking params unlikely to move pooled mAP@50 materially"
+  },
+
+  "execution": { "gpu_memory_per_job_gb": 6.0, "safety_margin_gb": 4.0, "checkpoint_frequency": 10 },
+
+  "dataset_subset": {
+    "filters": {
+      "weather": ["clear", "cloudy", "foggy", "overcast", "rainy"],
+      "time": ["daytime", "night", "dawn/dusk"],
+      "max_frames_per_video": 200
+    },
+    "max_samples": null
+  },
+
+  "output_dir": "./shift_yolo_world_pooled13_grid_results"
+}

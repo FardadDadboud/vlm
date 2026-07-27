@@ -1,0 +1,41 @@
+{
+  "_purpose": "OWLv2 single-config JOINT grid, pooled mAP@50 over all 13 conditions. CHARACTERIZATION, not an expected win: OWLv2-TRUST(health_gate) sits at ~parity below its own vanilla (0.2377 vs 0.2540 pooled). OWLv2's posterior is FLAT (softmax-over-sigmoid), so TRUST's headroom is limited to reducing CACHE POLLUTION. This grid centers on cache-admission levers (tau1, tau1_rare_class_reduction, max_cache_size) + the fusion threshold — the one place a config MIGHT help. If flat, parity is the ceiling; the grid is deliberately SMALL (54 combos) to confirm saturation, not chase it.",
+  "_runner": "MUST be run with grid_search/narval/grid_search_runner_multidet.py (the stock grid_search_runner.py hardcodes GroundingDINODetector and cannot run OWLv2).",
+  "_stack": "PINNED transformers==4.57.6. Fixed: native_candidate_selection=true (dense-anchor, avoids query flood), health_gate_untracked=true (safe lever), detector.threshold=0.1, iou=0.7. data_root + detector.model_path are injected at run time by the sbatch (top-level).",
+
+  "base_config_path": "config/global_instance_Guassian_owlv2.json",
+
+  "grid_params": {
+    "adaptation.params.tau1":                      [0.8, 0.9, 0.95],
+    "adaptation.params.tau1_rare_class_reduction": [0.3, 0.6, 1.0],
+    "adaptation.params.max_cache_size":            [10, 25, 40],
+    "adaptation.params.fusion_confidence_threshold":[0.7, 0.85],
+
+    "adaptation.params.native_candidate_selection": [true],
+    "adaptation.params.health_gate_untracked":      [true],
+    "detector.threshold":                           [0.1],
+    "detector.iou_threshold":                       [0.7],
+    "save_class_probs":                             [false]
+  },
+
+  "_grid_design": {
+    "swept": 4,
+    "combos": "3*3*3*2 = 54  (fixed overrides are single-value, x1)",
+    "current_value_in_every_set": "tau1=0.8, rare_reduction=0.3, cache=25, fusion_conf=0.7 all present -> frozen config is in the grid",
+    "chunk_axis": "adaptation.params.tau1 (first swept param, length 3) -> 3 array chunks x 18 configs",
+    "expectation": "likely flat / parity-bound; a small cache-pollution win is the only plausible upside"
+  },
+
+  "execution": { "gpu_memory_per_job_gb": 8.0, "safety_margin_gb": 4.0, "checkpoint_frequency": 10 },
+
+  "dataset_subset": {
+    "filters": {
+      "weather": ["clear", "cloudy", "foggy", "overcast", "rainy"],
+      "time": ["daytime", "night", "dawn/dusk"],
+      "max_frames_per_video": 200
+    },
+    "max_samples": null
+  },
+
+  "output_dir": "./shift_owlv2_pooled13_grid_results"
+}
