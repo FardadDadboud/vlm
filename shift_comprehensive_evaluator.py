@@ -28,13 +28,23 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return config
 
 
-def _attach_optional_fields(pred: dict, detection_result, save_class_probs: bool) -> None:
+def _attach_optional_fields(pred: dict, detection_result, save_class_probs: bool,
+                            save_cache_state: bool = False) -> None:
     """T0b (rebuttal): OUTPUT-ONLY. When save_class_probs is set, append the
     post-adaptation probs, pre-adaptation (raw) probs, and per-detection track
     id / maturity to a prediction record. Probabilities are rounded to 5 dp.
     A field is emitted only when present (not None). Emits nothing when the flag
     is off, so default behaviour is byte-for-byte unchanged. Used by both the
-    per-video and frame-by-frame serialization sites so they behave identically."""
+    per-video and frame-by-frame serialization sites so they behave identically.
+    When save_cache_state is set, also append per-detection cache retrieval
+    diagnostics (Stage-1 instrumentation) and per-frame cache class composition."""
+    if save_cache_state:
+        cd = getattr(detection_result, 'cache_diag', None)
+        if cd is not None:
+            pred['cache_diag'] = cd  # per-detection dict (untracked) or None
+        ccc = getattr(detection_result, 'cache_class_counts', None)
+        if ccc is not None:
+            pred['cache_class_counts'] = {int(k): int(v) for k, v in ccc.items()}
     if not save_class_probs:
         return
 
@@ -138,7 +148,7 @@ def run_detector_on_dataset(detector, dataset, config: Dict[str, Any],
             'scores': [float(s) for s in detection_result.scores],
             'labels': [str(l) for l in detection_result.labels]
         }
-        _attach_optional_fields(pred, detection_result, config.get('save_class_probs', False))
+        _attach_optional_fields(pred, detection_result, config.get('save_class_probs', False), config.get('save_cache_state', False))
         predictions.append(pred)
         
         # Progress logging
@@ -250,7 +260,7 @@ def run_detector_by_video(detector, dataset, config: Dict[str, Any],
                 'video_id': video_id,
                 'frame_idx': frame_idx
             }
-            _attach_optional_fields(pred, detection_result, config.get('save_class_probs', False))
+            _attach_optional_fields(pred, detection_result, config.get('save_class_probs', False), config.get('save_cache_state', False))
             predictions.append(pred)
             total_processed += 1
         

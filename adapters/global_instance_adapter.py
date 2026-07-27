@@ -576,6 +576,15 @@ class GlobalInstanceAdapter(BaseAdapter):
         # if the cache is NOT ready, keep the RAW VLM probs (no cache relabel). Uses the
         # SAME cache_ready signal already computed; no new threshold. Detector-agnostic.
         self.health_gate_untracked = params.get('health_gate_untracked', False)
+        # Cache instrumentation (default OFF): dump per-untracked-detection RAW retrieval
+        # margin + fusion weights + per-frame cache class composition. Analysis only.
+        # save_cache_state is a TOP-LEVEL config key (like save_class_probs), so read it
+        # from the full config, falling back to adaptation.params for convenience.
+        self.save_cache_state = config.get('save_cache_state', params.get('save_cache_state', False))
+        # Per-detection margin gate (default OFF): revert an untracked cache relabel to
+        # RAW VLM when the fused-posterior margin (top1-top2) < margin_tau.
+        self.per_detection_margin_gate = params.get('per_detection_margin_gate', False)
+        self.margin_tau = params.get('margin_tau', 0.2)
         # Common-class fusion gate (default OFF): when the RAW VLM argmax and the
         # FUSED argmax are BOTH common classes and disagree, defer to the VLM.
         # Never fires if either argmax is a rare class -> protects rare recovery.
@@ -935,11 +944,15 @@ class GlobalInstanceAdapter(BaseAdapter):
         #     dbg['used_adapted_scores'] = False
         # ===== Stage 3: Global BCA+ Adaptation =====
         cache_ready = False  # always defined (set True below only when cache is healthy)
+        cache_diag_pre = None  # per-detection retrieval diagnostics (pre-NMS), set when save_cache_state
         if self.use_global_cache and self.global_cache is not None:
+            self.global_cache._diag_enabled = self.save_cache_state
             global_adapted_probs, cache_posteriors = self.global_cache.adapt_probs_batch(
                 features, boxes, class_probs, return_posteriors=True
             )
-            
+            if self.save_cache_state:
+                cache_diag_pre = getattr(self.global_cache, '_last_diag', None)  # length N (pre-NMS) or None
+
             # HEALTH-GATED: Only use adapted scores when cache is healthy
             cache_health = self._compute_cache_health()
             cache_ready = self._is_cache_ready() and cache_health > 0.3
@@ -1340,6 +1353,23 @@ class GlobalInstanceAdapter(BaseAdapter):
                     n_hgated += 1
             dbg['health_gate_untracked_fired'] = n_hgated
 
+        # ===== Per-detection margin gate (default OFF) =====
+        # Finer than health_gate_untracked: for an UNTRACKED detection whose cache
+        # relabeled it (p_global argmax != VLM argmax), accept the relabel only if the
+        # fused-posterior margin (top1-top2) >= margin_tau; otherwise revert to RAW VLM.
+        # Diagnostic showed GOOD relabels have higher margin than BAD (on G-DINO).
+        if self.per_detection_margin_gate and N_nms > 0:
+            n_mgated = 0
+            for i in range(N_nms):
+                if track_ids[i] < 0:  # untracked -> final_probs is pure p_global
+                    pg = np.asarray(final_probs[i])
+                    if int(np.argmax(pg)) != int(np.argmax(nms_raw_probs[i])):  # cache relabeled
+                        s = np.sort(pg)[::-1]
+                        if float(s[0] - s[1]) < self.margin_tau:  # low-confidence relabel -> revert
+                            final_probs[i] = nms_raw_probs[i]
+                            n_mgated += 1
+            dbg['margin_gate_reverted'] = n_mgated
+
         # ===== Common-class fusion gate (default OFF) =====
         # Gates ONLY the final fusion combination. Cache/STAD updates above already
         # consumed RAW probs (Stage 8), so invariant 3 is unaffected.
@@ -1539,6 +1569,19 @@ class GlobalInstanceAdapter(BaseAdapter):
                 result.track_ids = list(track_ids)
             if hasattr(result, 'track_hits'):
                 result.track_hits = _hits_out
+            # Cache instrumentation (save_cache_state): map pre-NMS retrieval diag
+            # through nms_indices; attach per untracked detection (None for tracked
+            # and phantom tail). Plus per-frame cache class composition.
+            if self.save_cache_state and hasattr(result, 'cache_diag'):
+                if cache_diag_pre is not None:
+                    _diag_nms = [cache_diag_pre[i] for i in nms_indices]  # length N_real
+                else:
+                    _diag_nms = [None] * _n_real
+                _diag_out = [(_diag_nms[i] if track_ids[i] < 0 else None) for i in range(_n_real)]
+                _diag_out += [None] * (_n_out - _n_real)
+                result.cache_diag = _diag_out
+                if self.global_cache is not None:
+                    result.cache_class_counts = self.global_cache.cache_class_counts()
         except Exception as _e:
             print(f"[T0b] optional-field attach skipped (output-only, non-fatal): {_e}")
 

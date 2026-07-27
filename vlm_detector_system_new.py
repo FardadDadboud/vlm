@@ -74,6 +74,8 @@ class DetectionResult:
     raw_class_probs: Optional[list] = None          # pre-adaptation VLM probs, per detection
     track_ids: Optional[list] = None                # per-detection track id, -1 if untracked
     track_hits: Optional[list] = None               # per-detection track maturity (hits), 0 if untracked
+    cache_diag: Optional[list] = None               # per-detection cache retrieval diagnostics (save_cache_state)
+    cache_class_counts: Optional[dict] = None        # per-frame cache per-class member counts (save_cache_state)
 
 
 class BaseDetector(ABC):
@@ -1106,6 +1108,11 @@ class YOLOWorldDetector(BaseDetector):
         self.model = None
         self.classes_set = False
         self.last_texts = None
+        # Set by the adapter (native_candidate_selection): return the native sparse
+        # candidate set from detect_with_features instead of the full anchor grid.
+        self.native_selection = False
+        self.native_selection_iou = 0.7
+        self.native_selection_threshold = 0.1
         self.load_model()
 
     def load_model(self):
@@ -1177,6 +1184,112 @@ class YOLOWorldDetector(BaseDetector):
             labels=labels,
             image_path="",
             model_path=self.model_path
+        )
+
+    def detect_with_features(self, image: Image.Image, texts: List[str],
+                             threshold: float = 0.05, alpha: float = 0.7) -> DetectionResult:
+        """TRUST feature path for YOLO-World (dense anchor, mirrors OWLv2).
+
+        Captures per-anchor 512-D visual embeddings (ContrastiveHead cv4 inputs,
+        text-aligned) and the head's decoded (box + per-class sigmoid) outputs, both
+        over the SAME anchor grid. Returns all anchors (or the native-selected sparse
+        set when self.native_selection is True) so the adapter drives BCA+/STAD.
+        """
+        if not texts or not isinstance(texts, list):
+            return DetectionResult([], [], [], "", self.model_path)
+        if not self.classes_set or self.last_texts != texts:
+            self.model.set_classes(texts); self.classes_set = True; self.last_texts = list(texts)
+
+        head = self.model.model.model[-1]
+        cap = {}
+
+        def _mk(i):
+            def _h(mod, inp):
+                cap.setdefault('emb', {})[i] = inp[0].detach()
+            return _h
+        handles = [c.register_forward_pre_hook(_mk(i)) for i, c in enumerate(head.cv4)]
+
+        def _hh(mod, inp, out):
+            cap['head'] = out[0] if isinstance(out, (tuple, list)) else out
+        handles.append(head.register_forward_hook(_hh))
+
+        img_np = np.array(image)
+        orig_w, orig_h = image.size
+        try:
+            # conf low / iou high -> keep the full anchor grid flowing through the head hook
+            self.model.predict(img_np, conf=0.001, iou=0.99, verbose=False,
+                               device=self.device, half=False)
+        finally:
+            for h in handles:
+                h.remove()
+
+        if 'head' not in cap or 'emb' not in cap:
+            return DetectionResult([], [], [], "", self.model_path)
+
+        ho = cap['head'][0].float().cpu().numpy()          # (4+K, A) decoded xywh + sigmoid scores
+        # embeddings concatenated in FPN order (matches head anchor order)
+        embs = []
+        for i in sorted(cap['emb']):
+            e = cap['emb'][i][0].float().cpu().numpy()      # (512, h, w)
+            C, H, W = e.shape
+            embs.append(e.reshape(C, H * W).T)              # (h*w, 512)
+        emb = np.concatenate(embs, axis=0)                  # (A, 512)
+        # model input size from the stride-8 (largest) grid
+        h0, w0 = cap['emb'][sorted(cap['emb'])[0]].shape[2:]
+        in_h, in_w = h0 * 8, w0 * 8
+        gain = min(in_h / orig_h, in_w / orig_w)
+        pad_w = (in_w - orig_w * gain) / 2.0
+        pad_h = (in_h - orig_h * gain) / 2.0
+
+        # Head emits xyxy in letterbox pixel coords; invert the letterbox to original.
+        x1 = (ho[0] - pad_w) / gain
+        y1 = (ho[1] - pad_h) / gain
+        x2 = (ho[2] - pad_w) / gain
+        y2 = (ho[3] - pad_h) / gain
+        boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)     # (A, 4) original coords
+        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0.0, orig_w)
+        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0.0, orig_h)
+
+        sig = ho[4:].T                                      # (A, K) native per-class sigmoid
+        sig = np.nan_to_num(sig, nan=0.0, posinf=1.0, neginf=0.0)
+        class_probs = sig / (np.sum(sig, axis=1, keepdims=True) + 1e-8)  # simplex for BCA+/STAD
+        all_scores = sig.max(axis=1)                        # native YOLO-World confidence
+        all_label_indices = sig.argmax(axis=1)
+        all_labels = [texts[i] for i in all_label_indices]
+
+        emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+        raw_decoder_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+        if alpha > 0:
+            semantic_norm = class_probs / (np.linalg.norm(class_probs, axis=1, keepdims=True) + 1e-8)
+            hybrid_features = np.concatenate([(1 - alpha) * raw_decoder_norm, alpha * semantic_norm], axis=1)
+        else:
+            hybrid_features = raw_decoder_norm
+
+        # Native candidate selection (mirror OWLv2): reduce the dense grid to the
+        # detector's native sparse set BEFORE the adapter, else the dense grid floods.
+        if getattr(self, 'native_selection', False):
+            thr = threshold
+            iou = getattr(self, 'native_selection_iou', 0.7)
+            keep = np.where(all_scores >= thr)[0]
+            if len(keep) > 0:
+                nk = self._nms_boxes(boxes_xyxy[keep].tolist(), all_scores[keep].tolist(), iou)
+                sel = keep[np.asarray(nk, dtype=int)]
+            else:
+                sel = keep
+            boxes_xyxy = boxes_xyxy[sel]; all_scores = all_scores[sel]
+            all_labels = [all_labels[i] for i in sel]
+            hybrid_features = hybrid_features[sel]; class_probs = class_probs[sel]
+            raw_decoder_norm = raw_decoder_norm[sel]
+
+        return DetectionResult(
+            boxes=boxes_xyxy.tolist(),
+            scores=all_scores.tolist(),
+            labels=all_labels,
+            image_path="",
+            model_path=self.model_path,
+            features=hybrid_features,
+            class_probs=class_probs,
+            raw_features=raw_decoder_norm,
         )
 
 
