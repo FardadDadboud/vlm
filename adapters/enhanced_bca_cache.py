@@ -357,13 +357,43 @@ class EnhancedBCAPlusCache:
         
         w_vlm = np.exp(-H_vlm)[:, np.newaxis]     # (N, 1)
         w_cache = np.exp(-H_cache)[:, np.newaxis]  # (N, 1)
-        
+
         adapted = (w_vlm * class_probs + w_cache * cache_probs) / (w_vlm + w_cache + eps)
         adapted = adapted / (adapted.sum(axis=1, keepdims=True) + eps)
-        
+
+        # Diagnostics (default OFF): capture per-detection RAW retrieval margin +
+        # fusion weights on the FROZEN snapshot used above (kept consistent with the
+        # p_global returned here). Read-only stash; does not alter posterior/fusion.
+        if getattr(self, '_diag_enabled', False):
+            feats_n = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-10)
+            S_F = feats_n @ self.F_cache  # (N, M) cosine sims (F_cache is normalized)
+            proto_cls = np.argmax(self.V_cache, axis=0)  # (M,) each prototype's class
+            diag = []
+            for n in range(N):
+                order = np.argsort(-S_F[n])
+                t1 = int(order[0]); t2 = int(order[1]) if len(order) > 1 else t1
+                diag.append({
+                    'top1_class': int(proto_cls[t1]), 'top1_cos': float(S_F[n, t1]),
+                    'top2_class': int(proto_cls[t2]), 'top2_cos': float(S_F[n, t2]),
+                    'retrieval_margin': float(S_F[n, t1] - S_F[n, t2]),
+                    'w_vlm': float(w_vlm[n, 0]), 'w_cache': float(w_cache[n, 0]),
+                    'cache_probs': [round(float(x), 5) for x in cache_probs[n]],
+                })
+            self._last_diag = diag
+        else:
+            self._last_diag = None
+
         if return_posteriors:
             return adapted, posterior
         return adapted
+
+    def cache_class_counts(self) -> dict:
+        """Per-class count of cache members (argmax of each prototype's V vector)."""
+        if self.M == 0:
+            return {}
+        from collections import Counter
+        c = Counter(int(k) for k in np.argmax(self.V_cache[:, :self.M], axis=0))
+        return {int(k): int(v) for k, v in c.items()}
     
     def update_cache(self, features: np.ndarray, boxes: np.ndarray,
                     probs: np.ndarray, scores: np.ndarray,
